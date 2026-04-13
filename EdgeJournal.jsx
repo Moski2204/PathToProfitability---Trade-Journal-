@@ -2766,7 +2766,7 @@ function DashboardWorkbenchView({trades}){
           <div>
             <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800,marginBottom:6}}>Recent Trades</div>
             <div style={{fontSize:22,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif",marginBottom:4}}>Execution Preview</div>
-            <div style={{fontSize:13,color:C.muted,lineHeight:1.65}}>Ticker, P&amp;L, ROI, and behavior in one scan.</div>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.65}}>Ticker, P&amp;L and ROI in one scan.</div>
           </div>
 
           <div style={{display:"grid",gap:10}}>
