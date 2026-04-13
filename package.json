@@ -1,0 +1,26 @@
+{
+  "name": "trading-journal",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"npm:api\" \"npm:frontend\"",
+    "frontend": "vite",
+    "api": "node server.mjs",
+    "build": "vite build",
+    "preview": "node server.mjs --prod"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "chart.js": "^4.4.9",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.2.1",
+    "vite": "^5.4.10"
+  }
+}

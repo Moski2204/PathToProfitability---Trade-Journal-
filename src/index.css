@@ -1,0 +1,130 @@
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(circle at top left, rgba(59,130,246,0.16), transparent 32%),
+    radial-gradient(circle at top right, rgba(139,92,246,0.10), transparent 28%),
+    linear-gradient(180deg, #f8fbff 0%, #f7f9fc 100%);
+  color: #0f172a;
+  font-family: "Manrope", "Sora", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background 0.25s ease, color 0.25s ease;
+}
+
+body[data-theme="dark"] {
+  background:
+    radial-gradient(circle at top left, rgba(59,130,246,0.20), transparent 32%),
+    radial-gradient(circle at top right, rgba(139,92,246,0.12), transparent 28%),
+    linear-gradient(180deg, #09111f 0%, #08111f 100%);
+  color: #e6eef9;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+*::selection {
+  background: rgba(59,130,246,0.18);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+input,
+select,
+textarea {
+  transition: all 0.2s ease;
+}
+
+button:active {
+  transform: translateY(1px) scale(0.99);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(59, 130, 246, 0.38);
+  box-shadow:
+    0 0 0 4px rgba(59, 130, 246, 0.10),
+    inset 0 0 0 1px rgba(59, 130, 246, 0.22);
+}
+
+a {
+  color: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(226, 232, 240, 0.6);
+}
+
+body[data-theme="dark"] ::-webkit-scrollbar-track {
+  background: rgba(15, 27, 45, 0.78);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.55);
+  border-radius: 999px;
+}
+
+body[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: rgba(144, 164, 193, 0.34);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.75);
+}
+
+body[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(144, 164, 193, 0.52);
+}
+
+@keyframes riseIn {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulseDot {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.25);
+  }
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
