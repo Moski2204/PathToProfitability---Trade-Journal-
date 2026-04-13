@@ -63,6 +63,60 @@ function serializeUser(user) {
   };
 }
 
+function normalizeReflectionInput(input) {
+  const date = String(input?.date || "").trim();
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new Error("Reflection date must be in YYYY-MM-DD format.");
+  }
+
+  return {
+    date,
+    overall_summary: String(input?.overall_summary || "").trim(),
+    did_right: String(input?.did_right || "").trim(),
+    did_wrong: String(input?.did_wrong || "").trim(),
+    improve_tomorrow: String(input?.improve_tomorrow || "").trim(),
+  };
+}
+
+function sortReflectionsDescending(reflections) {
+  return [...reflections].sort((a, b) => {
+    const byDate = String(b.date || "").localeCompare(String(a.date || ""));
+    if (byDate !== 0) return byDate;
+    return String(b.updated_at || "").localeCompare(String(a.updated_at || ""));
+  });
+}
+
+function getUserReflections(user) {
+  return Array.isArray(user.reflections) ? user.reflections : [];
+}
+
+function upsertUserReflection(user, input) {
+  const nextInput = normalizeReflectionInput(input);
+  const now = new Date().toISOString();
+  const current = getUserReflections(user);
+  const existing = current.find((entry) => entry.date === nextInput.date);
+
+  if (existing) {
+    Object.assign(existing, nextInput, {
+      updated_at: now,
+    });
+    user.reflections = sortReflectionsDescending(current);
+    return existing;
+  }
+
+  const created = {
+    id: crypto.randomUUID(),
+    user_id: user.id,
+    ...nextInput,
+    created_at: now,
+    updated_at: now,
+  };
+
+  user.reflections = sortReflectionsDescending([...current, created]);
+  return created;
+}
+
 function signToken(user) {
   return jwt.sign(
     {
@@ -148,6 +202,7 @@ app.post("/api/auth/register", async (req, res) => {
     email,
     passwordHash,
     trades: [],
+    reflections: [],
     createdAt: new Date().toISOString(),
   };
 
@@ -158,6 +213,7 @@ app.post("/api/auth/register", async (req, res) => {
     token: signToken(user),
     user: serializeUser(user),
     trades: user.trades,
+    reflections: getUserReflections(user),
   });
 });
 
@@ -186,6 +242,7 @@ app.post("/api/auth/login", async (req, res) => {
     token: signToken(user),
     user: serializeUser(user),
     trades: Array.isArray(user.trades) ? user.trades : [],
+    reflections: getUserReflections(user),
   });
 });
 
@@ -193,6 +250,7 @@ app.get("/api/auth/session", authenticate, async (req, res) => {
   return res.json({
     user: serializeUser(req.user),
     trades: Array.isArray(req.user.trades) ? req.user.trades : [],
+    reflections: getUserReflections(req.user),
   });
 });
 
@@ -215,6 +273,32 @@ app.put("/api/trades", authenticate, async (req, res) => {
   await writeDatabase(database);
 
   return res.json({ trades: user.trades });
+});
+
+app.put("/api/reflections", authenticate, async (req, res) => {
+  const reflection = req.body?.reflection;
+
+  if (!reflection || typeof reflection !== "object" || Array.isArray(reflection)) {
+    return res.status(400).json({ error: "Reflection payload must be an object." });
+  }
+
+  const database = await readDatabase();
+  const user = database.users.find((entry) => entry.id === req.user.id);
+
+  if (!user) {
+    return res.status(401).json({ error: "Session is no longer valid." });
+  }
+
+  try {
+    upsertUserReflection(user, reflection);
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : "Invalid reflection." });
+  }
+
+  user.updatedAt = new Date().toISOString();
+  await writeDatabase(database);
+
+  return res.json({ reflections: getUserReflections(user) });
 });
 
 if (isProduction) {

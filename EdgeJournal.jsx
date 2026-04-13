@@ -223,6 +223,44 @@ function saveLocalAuthDb(db){
   if(!saved)throw new Error("Browser storage is full. Start the journal server to save screenshot-heavy trades reliably.");
 }
 
+function sortReflectionsDescending(reflections){
+  return [...reflections].sort((a,b)=>String(b.date||"").localeCompare(String(a.date||""))||String(b.updated_at||"").localeCompare(String(a.updated_at||"")));
+}
+
+function normalizeReflection(reflection,userId=""){
+  if(!reflection||typeof reflection!=="object")return null;
+  const date=String(reflection.date||"").trim();
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return null;
+
+  const createdAt=String(reflection.created_at||reflection.createdAt||new Date().toISOString());
+  const updatedAt=String(reflection.updated_at||reflection.updatedAt||createdAt);
+
+  return{
+    id:String(reflection.id||`reflection-${crypto.randomUUID?.()||Date.now()}`),
+    user_id:String(reflection.user_id||reflection.userId||userId||""),
+    date,
+    overall_summary:String(reflection.overall_summary||reflection.overallSummary||"").trim(),
+    did_right:String(reflection.did_right||reflection.didRight||"").trim(),
+    did_wrong:String(reflection.did_wrong||reflection.didWrong||"").trim(),
+    improve_tomorrow:String(reflection.improve_tomorrow||reflection.improveTomorrow||"").trim(),
+    created_at:createdAt,
+    updated_at:updatedAt,
+  };
+}
+
+function normalizeReflections(reflections,userId=""){
+  const byDate={};
+  (Array.isArray(reflections)?reflections:[]).forEach(reflection=>{
+    const normalized=normalizeReflection(reflection,userId);
+    if(!normalized)return;
+    const existing=byDate[normalized.date];
+    if(!existing||String(normalized.updated_at||"").localeCompare(String(existing.updated_at||""))>0){
+      byDate[normalized.date]=normalized;
+    }
+  });
+  return sortReflectionsDescending(Object.values(byDate));
+}
+
 function encodeBase64Url(value){
   const bytes=value instanceof Uint8Array?value:new TextEncoder().encode(value);
   let binary="";
@@ -329,6 +367,7 @@ async function localRegister({username,email,password}){
     email:normalizedEmail,
     passwordHash:await bcrypt.hash(password,10),
     trades:[],
+    reflections:[],
     createdAt:new Date().toISOString(),
   };
 
@@ -339,6 +378,7 @@ async function localRegister({username,email,password}){
     token:await signLocalToken(user),
     user:serializeLocalUser(user),
     trades:user.trades,
+    reflections:user.reflections,
   };
 }
 
@@ -356,6 +396,7 @@ async function localLogin({identifier,password}){
     token:await signLocalToken(user),
     user:serializeLocalUser(user),
     trades:Array.isArray(user.trades)?user.trades:[],
+    reflections:normalizeReflections(user.reflections,user.id),
   };
 }
 
@@ -369,6 +410,7 @@ async function localSession(token){
   return{
     user:serializeLocalUser(user),
     trades:Array.isArray(user.trades)?user.trades:[],
+    reflections:normalizeReflections(user.reflections,user.id),
   };
 }
 
@@ -384,6 +426,45 @@ async function localSaveTrades(token,trades){
   saveLocalAuthDb(db);
 
   return{trades:user.trades};
+}
+
+async function localSaveReflection(token,reflection){
+  const payload=await verifyLocalToken(token);
+  const db=loadLocalAuthDb();
+  const user=db.users.find(entry=>entry.id===payload.sub);
+
+  if(!user)throw new Error("Session is no longer valid.");
+
+  const normalized=normalizeReflection(reflection,user.id);
+  if(!normalized)throw new Error("Reflection date must be in YYYY-MM-DD format.");
+
+  const current=normalizeReflections(user.reflections,user.id);
+  const existing=current.find(entry=>entry.date===normalized.date);
+  const now=new Date().toISOString();
+
+  user.reflections=normalizeReflections([
+    ...current.filter(entry=>entry.date!==normalized.date),
+    existing
+      ?{
+        ...existing,
+        ...normalized,
+        id:existing.id,
+        user_id:user.id,
+        created_at:existing.created_at,
+        updated_at:now,
+      }
+      :{
+        ...normalized,
+        id:normalized.id||`reflection-${crypto.randomUUID?.()||Date.now()}`,
+        user_id:user.id,
+        created_at:now,
+        updated_at:now,
+      },
+  ],user.id);
+  user.updatedAt=now;
+  saveLocalAuthDb(db);
+
+  return{reflections:user.reflections};
 }
 
 function getApiCandidates(path){
@@ -2422,6 +2503,11 @@ function formatTradeCountLabel(count){
   return`${count} trade${count!==1?"s":""}`;
 }
 
+function formatReflectionDate(dateValue){
+  const parsed=parseDateOnly(dateValue);
+  return parsed?parsed.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric",year:"numeric"}):String(dateValue||"");
+}
+
 function buildDashboardLeakItem(trades,dataset=buildCoachDataset(trades)){
   if(!trades.length)return null;
 
@@ -2640,7 +2726,117 @@ function DashboardStatCard({label,value,sub,detail,icon="spark",tone="neutral",f
   </Card>;
 }
 
-function DashboardWorkbenchView({trades}){
+function DailyReflectionCard({reflections,onSave,saving=false}){
+  const todayKey=dateToKey(new Date());
+  const todayReflection=useMemo(()=>reflections.find(reflection=>reflection.date===todayKey)||null,[reflections,todayKey]);
+  const [expandedDate,setExpandedDate]=useState("");
+  const [draft,setDraft]=useState({
+    overall_summary:"",
+    did_right:"",
+    did_wrong:"",
+    improve_tomorrow:"",
+  });
+  const history=useMemo(()=>sortReflectionsDescending(reflections),[reflections]);
+
+  useEffect(()=>{
+    setDraft({
+      overall_summary:todayReflection?.overall_summary||"",
+      did_right:todayReflection?.did_right||"",
+      did_wrong:todayReflection?.did_wrong||"",
+      improve_tomorrow:todayReflection?.improve_tomorrow||"",
+    });
+  },[todayReflection,todayKey]);
+
+  const updateField=(key,value)=>setDraft(current=>({...current,[key]:value}));
+  const hasTodayEntry=Boolean(todayReflection);
+  const handleSave=()=>onSave?.({date:todayKey,...draft});
+  const savedTimestamp=todayReflection?.updated_at
+    ?new Date(todayReflection.updated_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})
+    :"";
+  const fields=[
+    {key:"overall_summary",label:"How was your trading day overall?",placeholder:"Summarize the session, emotional tone, and how well you followed your plan."},
+    {key:"did_right",label:"What did you do right?",placeholder:"Capture the behaviors, decisions, or routines that helped you today."},
+    {key:"did_wrong",label:"What did you do wrong?",placeholder:"Be specific about the mistakes, missed rules, or weak execution."},
+    {key:"improve_tomorrow",label:"What will you do better tomorrow?",placeholder:"Write the one or two adjustments you want to carry into the next session."},
+  ];
+
+  return<Card style={{padding:"20px",display:"grid",gap:18,background:`linear-gradient(180deg, ${C.surface}, ${C.surfaceAlt})`,boxShadow:`${C.shadow}, inset 0 0 0 1px rgba(148,163,184,0.10)`}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:16,flexWrap:"wrap"}}>
+      <div style={{display:"grid",gap:8}}>
+        <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800}}>Daily Trading Reflection</div>
+        <div style={{fontSize:24,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif",lineHeight:1.15,letterSpacing:"-0.03em"}}>{"Today's Execution Review"}</div>
+      </div>
+      <div style={{display:"grid",gap:8,justifyItems:"end"}}>
+        <Pill label={formatReflectionDate(todayKey)} color={C.accent}/>
+        {hasTodayEntry&&<div style={{fontSize:12,color:C.muted}}>Saved for today{savedTimestamp?` | Updated ${savedTimestamp}`:""}</div>}
+      </div>
+    </div>
+
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:12}}>
+      {fields.map(field=><div key={field.key} style={{display:"grid",gap:8}}>
+        <div style={{fontSize:12,color:C.textSoft,fontWeight:800,lineHeight:1.5}}>{field.label}</div>
+        <textarea
+          value={draft[field.key]}
+          onChange={event=>updateField(field.key,event.target.value)}
+          placeholder={field.placeholder}
+          style={inp({minHeight:116,padding:"14px 16px",resize:"vertical",lineHeight:1.7,background:C.surfaceSoft,fontFamily:"inherit"})}
+        />
+      </div>)}
+    </div>
+
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+      <div style={{fontSize:12,color:C.muted,lineHeight:1.65}}>{hasTodayEntry?"Your reflection for today is loaded and can be edited in place.":"No reflection saved for today yet. Save one to start your daily execution record."}</div>
+      <button
+        type="button"
+        onClick={handleSave}
+        disabled={saving}
+        style={{...btnBase(),padding:"11px 16px",borderRadius:999,background:`linear-gradient(180deg, ${C.accent}, ${C.accentStrong})`,color:"#fff",boxShadow:"0 18px 30px rgba(59,130,246,0.22)",opacity:saving?0.7:1}}
+      >
+        {saving?"Saving...":"Save Reflection"}
+      </button>
+    </div>
+
+    <div style={{height:1,background:C.border,opacity:0.75}}/>
+
+    <div style={{display:"grid",gap:12}}>
+      <div>
+        <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800,marginBottom:6}}>Previous Reflections</div>
+        <div style={{fontSize:13,color:C.muted,lineHeight:1.65}}>Saved in reverse chronological order. Open any day to review the exact notes you wrote.</div>
+      </div>
+
+      {history.length===0
+        ?<div style={{padding:"16px 18px",borderRadius:18,background:C.surfaceSoft,boxShadow:"inset 0 0 0 1px rgba(148,163,184,0.10)",fontSize:13,color:C.muted,lineHeight:1.7}}>
+          No daily reflections saved yet.
+        </div>
+        :<div style={{display:"grid",gap:10}}>
+          {history.map(reflection=>{
+            const expanded=expandedDate===reflection.date;
+            return<div key={reflection.id} style={{borderRadius:18,background:C.surfaceSoft,boxShadow:"inset 0 0 0 1px rgba(148,163,184,0.10)",overflow:"hidden"}}>
+              <button
+                type="button"
+                onClick={()=>setExpandedDate(current=>current===reflection.date?"":reflection.date)}
+                style={{...btnBase(),width:"100%",padding:"15px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,textAlign:"left",background:"transparent",borderRadius:0}}
+              >
+                <div style={{display:"grid",gap:5}}>
+                  <div style={{fontSize:14,fontWeight:800,color:C.text}}>{formatReflectionDate(reflection.date)}</div>
+                  <div style={{fontSize:12,color:C.muted,lineHeight:1.55}}>{clipText(reflection.overall_summary||reflection.did_wrong||reflection.did_right||reflection.improve_tomorrow||"No text saved for this day yet.",96)}</div>
+                </div>
+                <div style={{fontSize:12,color:expanded?C.accent:C.muted,fontWeight:800,whiteSpace:"nowrap"}}>{expanded?"Hide":"Open"}</div>
+              </button>
+              {expanded&&<div style={{padding:"0 16px 16px",display:"grid",gap:10}}>
+                {fields.map(field=><div key={`${reflection.id}-${field.key}`} style={{padding:"12px 13px",borderRadius:14,background:C.surface,boxShadow:"inset 0 0 0 1px rgba(148,163,184,0.08)"}}>
+                  <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:800,marginBottom:6}}>{field.label}</div>
+                  <div style={{fontSize:13,color:C.textSoft,lineHeight:1.7,whiteSpace:"pre-wrap"}}>{reflection[field.key]||"No entry."}</div>
+                </div>)}
+              </div>}
+            </div>;
+          })}
+        </div>}
+    </div>
+  </Card>;
+}
+
+function DashboardWorkbenchView({trades,reflections,onSaveReflection,reflectionSaving}){
   const[range,setRange]=useState("ALL");
   const {
     chronologicalTrades,
@@ -2691,7 +2887,10 @@ function DashboardWorkbenchView({trades}){
     };
   },[trades,range,ACTIVE_THEME]);
 
-  if(!trades.length)return<EmptyState icon="chart" title="Start your first review cycle" message="Log a trade to unlock your command center, core metrics, and recent execution context."/>;
+  if(!trades.length)return<div style={{display:"grid",gap:14,animation:"riseIn .45s ease both"}}>
+    <DailyReflectionCard reflections={reflections} onSave={onSaveReflection} saving={reflectionSaving}/>
+    <EmptyState icon="chart" title="Start your first review cycle" message="Log a trade to unlock your command center, core metrics, and recent execution context."/>
+  </div>;
 
   return<div style={{display:"grid",gap:14,animation:"riseIn .45s ease both"}}>
     <Card accent={C.accent} style={{padding:"14px 12px",background:C.heroPanel,boxShadow:C.shadowMd}}>
@@ -2764,6 +2963,8 @@ function DashboardWorkbenchView({trades}){
         </div>
       </Card>
 
+      <DailyReflectionCard reflections={reflections} onSave={onSaveReflection} saving={reflectionSaving}/>
+
       <Card style={{padding:"18px",display:"grid",gap:14}}>
           <div>
             <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800,marginBottom:6}}>Recent Trades</div>
@@ -2789,6 +2990,10 @@ function DashboardWorkbenchView({trades}){
             })}
           </div>
         </Card>
+
+      <Card style={{padding:"22px 22px 24px"}}>
+        <AnalyticsCalendar trades={trades}/>
+      </Card>
     </>}
   </div>;
 }
@@ -4325,15 +4530,16 @@ function AnalyticsView({trades}){
       </div>
     </Card>}
 
-    <Card style={{padding:"22px 22px 24px"}}>
-      <AnalyticsCalendar trades={trades}/>
-    </Card>
   </div>;
 }
 
 function StreakView({pnls,trades}){
   const sequence=Array.isArray(trades)&&trades.length
-    ?trades.map(getTradeOutcome).filter(outcome=>outcome!=="WASH").map(outcome=>outcome==="WIN"?"W":"L")
+    ?[...trades]
+      .sort((a,b)=>getTradeDateTime(a)-getTradeDateTime(b))
+      .map(getTradeOutcome)
+      .filter(outcome=>outcome!=="WASH")
+      .map(outcome=>outcome==="WIN"?"W":"L")
     :(Array.isArray(pnls)?pnls:[]).map(pnl=>pnl>0?"W":"L");
   let cur=0,curType=null,maxW=0,maxL=0,w=0,l=0;
   sequence.forEach(type=>{
@@ -4625,6 +4831,7 @@ function exportCSV(trades){
 // â”€â”€ APP ROOT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function App(){
   const[trades,setTrades]=useState([]);
+  const[reflections,setReflections]=useState([]);
   const[loaded,setLoaded]=useState(false);
   const[view,setView]=useState(getStoredView);
   const[theme,setTheme]=useState(getStoredTheme);
@@ -4638,6 +4845,7 @@ function App(){
   const[authMode,setAuthMode]=useState("login");
   const[authBusy,setAuthBusy]=useState(false);
   const[authError,setAuthError]=useState("");
+  const[reflectionSaving,setReflectionSaving]=useState(false);
 
   C=theme==="dark"?DARK_THEME:LIGHT_THEME;
   ACTIVE_THEME=theme;
@@ -4668,7 +4876,7 @@ function App(){
           ?await localSession(savedToken)
           :await apiRequest("/api/auth/session",{token:savedToken});
         if(!active)return;
-        await hydrateSession(savedToken,data.user,data.trades,savedSource);
+        await hydrateSession(savedToken,data.user,data.trades,savedSource,data.reflections);
       }catch(error){
         storage.remove(AUTH_TOKEN_KEY);
         storage.remove(AUTH_SOURCE_KEY);
@@ -4677,6 +4885,7 @@ function App(){
           setAuthSource("");
           setUser(null);
           setTrades([]);
+          setReflections([]);
           clearActivePanels();
           if(!isServerUnavailableError(error)&&savedSource==="local")setAuthError(error.message||"Please log in again.");
         }
@@ -4717,12 +4926,35 @@ function App(){
     }
   };
 
-  const hydrateSession=async(nextToken,nextUser,nextTrades,nextSource="server")=>{
+  const syncReflection=async(nextReflection)=>{
+    if(!authToken){
+      notify("Your session has ended. Please log in again.",C.red);
+      return false;
+    }
+
+    setReflectionSaving(true);
+    try{
+      const data=authSource==="local"
+        ?await localSaveReflection(authToken,nextReflection)
+        :await apiRequest("/api/reflections",{method:"PUT",token:authToken,body:{reflection:nextReflection}});
+      setReflections(normalizeReflections(data.reflections,user?.id));
+      notify("Daily reflection saved.");
+      return true;
+    }catch(error){
+      notify(error.message||"Unable to save reflection.",C.red);
+      return false;
+    }finally{
+      setReflectionSaving(false);
+    }
+  };
+
+  const hydrateSession=async(nextToken,nextUser,nextTrades,nextSource="server",nextReflections=[])=>{
     storage.set(AUTH_TOKEN_KEY,nextToken);
     storage.set(AUTH_SOURCE_KEY,nextSource);
     setAuthToken(nextToken);
     setAuthSource(nextSource);
     setUser(nextUser);
+    setReflections(normalizeReflections(nextReflections,nextUser?.id));
 
     const serverTrades=normalizeTrades(nextTrades);
     const legacyTrades=loadLegacyTradesFromStorage();
@@ -4772,7 +5004,7 @@ function App(){
         source="local";
       }
 
-      await hydrateSession(data.token,data.user,data.trades,source);
+      await hydrateSession(data.token,data.user,data.trades,source,data.reflections);
       clearActivePanels();
       notify(source==="local"
         ?isServerUnavailableError(loginError)
@@ -4802,7 +5034,7 @@ function App(){
         source="local";
       }
 
-      await hydrateSession(data.token,data.user,data.trades,source);
+      await hydrateSession(data.token,data.user,data.trades,source,data.reflections);
       clearActivePanels();
       notify(source==="local"
         ?`Account created for ${data.user.username}. Using local account mode.`
@@ -4820,6 +5052,7 @@ function App(){
     setAuthToken("");
     setAuthSource("");
     setUser(null);
+    setReflections([]);
     setAuthMode("login");
     setAuthError("");
     clearActivePanels();
@@ -4871,7 +5104,7 @@ function App(){
   const renderMain=()=>{
     if(isForm)return<TradeForm initial={editing} onSave={saveTrade} onCancel={closeTradeForm}/>;
     if(selected)return<TradeDetail trade={selected} onBack={closeDetailView} onEdit={openTradeEditor} onDelete={deleteTrade}/>;
-    if(view===0)return<DashboardWorkbenchView trades={trades}/>;
+    if(view===0)return<DashboardWorkbenchView trades={trades} reflections={reflections} onSaveReflection={syncReflection} reflectionSaving={reflectionSaving}/>;
     if(view===1)return<TradeLogView trades={trades} onSelect={openTradeDetail} onNew={openNewTrade} onEdit={openTradeEditor} onImportCSV={handleCSV} onExportCSV={()=>exportCSV(trades)} onResetJournal={resetJournal}/>;
     if(view===2)return<AnalyticsView trades={trades}/>;
     if(view===3)return<AICoach trades={trades}/>;
