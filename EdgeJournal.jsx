@@ -113,6 +113,7 @@ const MISTAKE_TAGS=[
   "No Confirmation",
   "Early Exit",
   "Panic Sold",
+  "Didn't sell in time",
   "Overtrading",
   "Revenge Trading",
   "Ignored Plan",
@@ -141,6 +142,7 @@ const LEGACY_MISTAKE_TAG_ALIASES={
   "FOMO":"Chasing",
   "Early Exit":"Early Exit",
   "Panic sold":"Panic Sold",
+  "Didnt sell in time":"Didn't sell in time",
   "Late Entry":"Entered Too Early",
   "Oversize":"Oversized Position",
   "No Stop":"Ignored Plan",
@@ -351,6 +353,10 @@ function isServerUnavailableError(error){
 
 function isInvalidCredentialsError(error){
   return /invalid login credentials/i.test(String(error?.message||""));
+}
+
+function isMissingReflectionRouteError(error){
+  return /\bnot found\b/i.test(String(error?.message||""));
 }
 
 async function localRegister({username,email,password}){
@@ -2729,29 +2735,50 @@ function DashboardStatCard({label,value,sub,detail,icon="spark",tone="neutral",f
 function DailyReflectionCard({reflections,onSave,saving=false}){
   const todayKey=dateToKey(new Date());
   const todayReflection=useMemo(()=>reflections.find(reflection=>reflection.date===todayKey)||null,[reflections,todayKey]);
+  const [activeDate,setActiveDate]=useState(todayKey);
   const [expandedDate,setExpandedDate]=useState("");
+  const emptyDraft={
+    overall_summary:"",
+    did_right:"",
+    did_wrong:"",
+    improve_tomorrow:"",
+  };
   const [draft,setDraft]=useState({
     overall_summary:"",
     did_right:"",
     did_wrong:"",
     improve_tomorrow:"",
   });
+  const skipHydrateRef=useRef(false);
   const history=useMemo(()=>sortReflectionsDescending(reflections),[reflections]);
+  const activeReflection=useMemo(()=>reflections.find(reflection=>reflection.date===activeDate)||null,[reflections,activeDate]);
+  const isEditingHistoryEntry=activeDate!==todayKey;
 
   useEffect(()=>{
-    setDraft({
-      overall_summary:todayReflection?.overall_summary||"",
-      did_right:todayReflection?.did_right||"",
-      did_wrong:todayReflection?.did_wrong||"",
-      improve_tomorrow:todayReflection?.improve_tomorrow||"",
-    });
-  },[todayReflection,todayKey]);
+    if(skipHydrateRef.current){
+      skipHydrateRef.current=false;
+      return;
+    }
+    setDraft(activeReflection?{
+      overall_summary:activeReflection.overall_summary||"",
+      did_right:activeReflection.did_right||"",
+      did_wrong:activeReflection.did_wrong||"",
+      improve_tomorrow:activeReflection.improve_tomorrow||"",
+    }:emptyDraft);
+  },[activeReflection,activeDate,todayKey]);
 
   const updateField=(key,value)=>setDraft(current=>({...current,[key]:value}));
   const hasTodayEntry=Boolean(todayReflection);
-  const handleSave=()=>onSave?.({date:todayKey,...draft});
-  const savedTimestamp=todayReflection?.updated_at
-    ?new Date(todayReflection.updated_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})
+  const handleSave=async()=>{
+    const saved=await onSave?.({date:activeDate,...draft});
+    if(saved){
+      skipHydrateRef.current=true;
+      setDraft(emptyDraft);
+      setActiveDate(todayKey);
+    }
+  };
+  const savedTimestamp=activeReflection?.updated_at
+    ?new Date(activeReflection.updated_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})
     :"";
   const fields=[
     {key:"overall_summary",label:"How was your trading day overall?",placeholder:"Summarize the session, emotional tone, and how well you followed your plan."},
@@ -2759,16 +2786,31 @@ function DailyReflectionCard({reflections,onSave,saving=false}){
     {key:"did_wrong",label:"What did you do wrong?",placeholder:"Be specific about the mistakes, missed rules, or weak execution."},
     {key:"improve_tomorrow",label:"What will you do better tomorrow?",placeholder:"Write the one or two adjustments you want to carry into the next session."},
   ];
+  const startEditingReflection=reflection=>{
+    skipHydrateRef.current=true;
+    setActiveDate(reflection.date);
+    setDraft({
+      overall_summary:reflection.overall_summary||"",
+      did_right:reflection.did_right||"",
+      did_wrong:reflection.did_wrong||"",
+      improve_tomorrow:reflection.improve_tomorrow||"",
+    });
+  };
+  const cancelEditing=()=>{
+    skipHydrateRef.current=true;
+    setActiveDate(todayKey);
+    setDraft(emptyDraft);
+  };
 
   return<Card style={{padding:"20px",display:"grid",gap:18,background:`linear-gradient(180deg, ${C.surface}, ${C.surfaceAlt})`,boxShadow:`${C.shadow}, inset 0 0 0 1px rgba(148,163,184,0.10)`}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:16,flexWrap:"wrap"}}>
       <div style={{display:"grid",gap:8}}>
         <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800}}>Daily Trading Reflection</div>
-        <div style={{fontSize:24,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif",lineHeight:1.15,letterSpacing:"-0.03em"}}>{"Today's Execution Review"}</div>
+        <div style={{fontSize:24,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif",lineHeight:1.15,letterSpacing:"-0.03em"}}>{isEditingHistoryEntry?"Edit Saved Reflection":"Today's Execution Review"}</div>
       </div>
       <div style={{display:"grid",gap:8,justifyItems:"end"}}>
-        <Pill label={formatReflectionDate(todayKey)} color={C.accent}/>
-        {hasTodayEntry&&<div style={{fontSize:12,color:C.muted}}>Saved for today{savedTimestamp?` | Updated ${savedTimestamp}`:""}</div>}
+        <Pill label={formatReflectionDate(activeDate)} color={isEditingHistoryEntry?C.amber:C.accent}/>
+        {activeReflection&&<div style={{fontSize:12,color:C.muted}}>{activeDate===todayKey?"Saved for today":"Editing saved entry"}{savedTimestamp?` | Updated ${savedTimestamp}`:""}</div>}
       </div>
     </div>
 
@@ -2785,15 +2827,25 @@ function DailyReflectionCard({reflections,onSave,saving=false}){
     </div>
 
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
-      <div style={{fontSize:12,color:C.muted,lineHeight:1.65}}>{hasTodayEntry?"Your reflection for today is loaded and can be edited in place.":"No reflection saved for today yet. Save one to start your daily execution record."}</div>
-      <button
-        type="button"
-        onClick={handleSave}
-        disabled={saving}
-        style={{...btnBase(),padding:"11px 16px",borderRadius:999,background:`linear-gradient(180deg, ${C.accent}, ${C.accentStrong})`,color:"#fff",boxShadow:"0 18px 30px rgba(59,130,246,0.22)",opacity:saving?0.7:1}}
-      >
-        {saving?"Saving...":"Save Reflection"}
-      </button>
+      <div style={{fontSize:12,color:C.muted,lineHeight:1.65}}>{isEditingHistoryEntry?"You are editing a saved reflection from history. Saving will update that day's entry.":hasTodayEntry?"Today's saved reflection is stored below in history. The form clears after each save so you can start fresh.":"No reflection saved for today yet. Save one to start your daily execution record."}</div>
+      <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+        {isEditingHistoryEntry&&<button
+          type="button"
+          onClick={cancelEditing}
+          disabled={saving}
+          style={{...btnBase(),padding:"11px 16px",borderRadius:999,background:C.surface}}
+        >
+          Cancel Edit
+        </button>}
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          style={{...btnBase(),padding:"11px 16px",borderRadius:999,background:`linear-gradient(180deg, ${C.accent}, ${C.accentStrong})`,color:"#fff",boxShadow:"0 18px 30px rgba(59,130,246,0.22)",opacity:saving?0.7:1}}
+        >
+          {saving?"Saving...":isEditingHistoryEntry?"Update Reflection":"Save Reflection"}
+        </button>
+      </div>
     </div>
 
     <div style={{height:1,background:C.border,opacity:0.75}}/>
@@ -2824,6 +2876,15 @@ function DailyReflectionCard({reflections,onSave,saving=false}){
                 <div style={{fontSize:12,color:expanded?C.accent:C.muted,fontWeight:800,whiteSpace:"nowrap"}}>{expanded?"Hide":"Open"}</div>
               </button>
               {expanded&&<div style={{padding:"0 16px 16px",display:"grid",gap:10}}>
+                <div style={{display:"flex",justifyContent:"flex-end"}}>
+                  <button
+                    type="button"
+                    onClick={()=>startEditingReflection(reflection)}
+                    style={{...btnBase(),padding:"9px 14px",borderRadius:999,background:C.surface,color:C.accent,fontWeight:800}}
+                  >
+                    Edit
+                  </button>
+                </div>
                 {fields.map(field=><div key={`${reflection.id}-${field.key}`} style={{padding:"12px 13px",borderRadius:14,background:C.surface,boxShadow:"inset 0 0 0 1px rgba(148,163,184,0.08)"}}>
                   <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:800,marginBottom:6}}>{field.label}</div>
                   <div style={{fontSize:13,color:C.textSoft,lineHeight:1.7,whiteSpace:"pre-wrap"}}>{reflection[field.key]||"No entry."}</div>
@@ -4941,7 +5002,12 @@ function App(){
       notify("Daily reflection saved.");
       return true;
     }catch(error){
-      notify(error.message||"Unable to save reflection.",C.red);
+      notify(
+        isMissingReflectionRouteError(error)
+          ?"Reflections API not available. Restart `npm run dev`, `npm run api`, or `npm run preview` so the backend loads `/api/reflections`."
+          :(error.message||"Unable to save reflection."),
+        C.red,
+      );
       return false;
     }finally{
       setReflectionSaving(false);
