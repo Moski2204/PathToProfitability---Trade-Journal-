@@ -263,6 +263,46 @@ function normalizeReflections(reflections,userId=""){
   return sortReflectionsDescending(Object.values(byDate));
 }
 
+function sortDailyAiReviewsDescending(reviews){
+  return [...reviews].sort((a,b)=>String(b.date||"").localeCompare(String(a.date||""))||String(b.updated_at||"").localeCompare(String(a.updated_at||"")));
+}
+
+function normalizeDailyAiReview(review,userId=""){
+  if(!review||typeof review!=="object")return null;
+  const date=String(review.date||"").trim();
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return null;
+
+  const createdAt=String(review.created_at||review.createdAt||new Date().toISOString());
+  const updatedAt=String(review.updated_at||review.updatedAt||createdAt);
+
+  return{
+    id:String(review.id||`daily-ai-review-${crypto.randomUUID?.()||Date.now()}`),
+    user_id:String(review.user_id||review.userId||userId||""),
+    date,
+    ai_summary:String(review.ai_summary||review.aiSummary||"").trim(),
+    strengths:String(review.strengths||"").trim(),
+    weaknesses:String(review.weaknesses||"").trim(),
+    tag_patterns:String(review.tag_patterns||review.tagPatterns||"").trim(),
+    behavior_patterns:String(review.behavior_patterns||review.behaviorPatterns||"").trim(),
+    tomorrow_focus:String(review.tomorrow_focus||review.tomorrowFocus||"").trim(),
+    created_at:createdAt,
+    updated_at:updatedAt,
+  };
+}
+
+function normalizeDailyAiReviews(reviews,userId=""){
+  const byDate={};
+  (Array.isArray(reviews)?reviews:[]).forEach(review=>{
+    const normalized=normalizeDailyAiReview(review,userId);
+    if(!normalized)return;
+    const existing=byDate[normalized.date];
+    if(!existing||String(normalized.updated_at||"").localeCompare(String(existing.updated_at||""))>0){
+      byDate[normalized.date]=normalized;
+    }
+  });
+  return sortDailyAiReviewsDescending(Object.values(byDate));
+}
+
 function encodeBase64Url(value){
   const bytes=value instanceof Uint8Array?value:new TextEncoder().encode(value);
   let binary="";
@@ -359,6 +399,10 @@ function isMissingReflectionRouteError(error){
   return /\bnot found\b/i.test(String(error?.message||""));
 }
 
+function isMissingDailyAiReviewRouteError(error){
+  return /\bnot found\b/i.test(String(error?.message||""));
+}
+
 async function localRegister({username,email,password}){
   const db=loadLocalAuthDb();
   const trimmedUsername=String(username||"").trim();
@@ -374,6 +418,7 @@ async function localRegister({username,email,password}){
     passwordHash:await bcrypt.hash(password,10),
     trades:[],
     reflections:[],
+    daily_ai_reviews:[],
     createdAt:new Date().toISOString(),
   };
 
@@ -385,6 +430,7 @@ async function localRegister({username,email,password}){
     user:serializeLocalUser(user),
     trades:user.trades,
     reflections:user.reflections,
+    daily_ai_reviews:user.daily_ai_reviews,
   };
 }
 
@@ -403,6 +449,7 @@ async function localLogin({identifier,password}){
     user:serializeLocalUser(user),
     trades:Array.isArray(user.trades)?user.trades:[],
     reflections:normalizeReflections(user.reflections,user.id),
+    daily_ai_reviews:normalizeDailyAiReviews(user.daily_ai_reviews,user.id),
   };
 }
 
@@ -417,6 +464,7 @@ async function localSession(token){
     user:serializeLocalUser(user),
     trades:Array.isArray(user.trades)?user.trades:[],
     reflections:normalizeReflections(user.reflections,user.id),
+    daily_ai_reviews:normalizeDailyAiReviews(user.daily_ai_reviews,user.id),
   };
 }
 
@@ -471,6 +519,45 @@ async function localSaveReflection(token,reflection){
   saveLocalAuthDb(db);
 
   return{reflections:user.reflections};
+}
+
+async function localSaveDailyAiReview(token,review){
+  const payload=await verifyLocalToken(token);
+  const db=loadLocalAuthDb();
+  const user=db.users.find(entry=>entry.id===payload.sub);
+
+  if(!user)throw new Error("Session is no longer valid.");
+
+  const normalized=normalizeDailyAiReview(review,user.id);
+  if(!normalized)throw new Error("AI review date must be in YYYY-MM-DD format.");
+
+  const current=normalizeDailyAiReviews(user.daily_ai_reviews,user.id);
+  const existing=current.find(entry=>entry.date===normalized.date);
+  const now=new Date().toISOString();
+
+  user.daily_ai_reviews=normalizeDailyAiReviews([
+    ...current.filter(entry=>entry.date!==normalized.date),
+    existing
+      ?{
+        ...existing,
+        ...normalized,
+        id:existing.id,
+        user_id:user.id,
+        created_at:existing.created_at,
+        updated_at:now,
+      }
+      :{
+        ...normalized,
+        id:normalized.id||`daily-ai-review-${crypto.randomUUID?.()||Date.now()}`,
+        user_id:user.id,
+        created_at:now,
+        updated_at:now,
+      },
+  ],user.id);
+  user.updatedAt=now;
+  saveLocalAuthDb(db);
+
+  return{daily_ai_reviews:user.daily_ai_reviews};
 }
 
 function getApiCandidates(path){
@@ -2514,6 +2601,128 @@ function formatReflectionDate(dateValue){
   return parsed?parsed.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric",year:"numeric"}):String(dateValue||"");
 }
 
+function extractSignalsFromText(text){
+  const cleaned=cleanTradeNoteText(text);
+  if(!cleaned)return[];
+  return NOTE_SIGNALS.filter(signal=>signal.patterns.some(pattern=>pattern.test(cleaned)));
+}
+
+function getDailyAiReviewTradeRows(trades){
+  return [...(Array.isArray(trades)?trades:[])]
+    .sort((a,b)=>getTradeDateTime(a)-getTradeDateTime(b))
+    .map(trade=>{
+      const pnl=calcPnl(trade);
+      const outcome=getTradeOutcome(trade);
+      const hour=trade.entries?.[0]?.time?.slice(0,2)||"";
+      return{
+        trade,
+        pnl,
+        outcome,
+        hour,
+        notes:getTradeNotesText(trade),
+      };
+    });
+}
+
+function formatLabelList(labels){
+  const unique=[...new Set(labels.filter(Boolean))];
+  if(!unique.length)return"";
+  if(unique.length===1)return unique[0];
+  if(unique.length===2)return`${unique[0]} and ${unique[1]}`;
+  return`${unique.slice(0,-1).join(", ")}, and ${unique[unique.length-1]}`;
+}
+
+function joinInsightLines(lines,fallback){
+  const unique=[...new Set(lines.map(line=>String(line||"").trim()).filter(Boolean))];
+  return unique.length?unique.join("\n"):fallback;
+}
+
+function buildDailyAiReview({date,reflection,trades}){
+  const dayTrades=[...(Array.isArray(trades)?trades:[])].filter(trade=>trade.date===date);
+  const rows=getDailyAiReviewTradeRows(dayTrades);
+  const stats=calcStats(rows.map(row=>row.trade));
+  const dataset=buildCoachDataset(rows.map(row=>row.trade));
+  const reflectionText=[
+    reflection?.overall_summary,
+    reflection?.did_right,
+    reflection?.did_wrong,
+    reflection?.improve_tomorrow,
+  ].map(cleanTradeNoteText).filter(Boolean).join(" ");
+  const reflectionSignals=extractSignalsFromText(reflectionText);
+  const positiveTagRows=buildBehaviorRows(rows.map(row=>row.trade),"positiveTags",{minTrades:1})
+    .sort((a,b)=>b.pnl-a.pnl||b.count-a.count||a.label.localeCompare(b.label));
+  const mistakeTagRows=buildBehaviorRows(rows.map(row=>row.trade),"mistakes",{minTrades:1})
+    .sort((a,b)=>a.pnl-b.pnl||b.count-a.count||a.label.localeCompare(b.label));
+  const wins=rows.filter(row=>row.outcome==="WIN");
+  const losses=rows.filter(row=>row.outcome==="LOSS");
+  const afterNoonLosses=losses.filter(row=>row.hour&&Number(row.hour)>=12);
+  const beforeNoonWins=wins.filter(row=>row.hour&&Number(row.hour)<12);
+  const bestStrategy=dataset.bestStrategy;
+  const bestHour=dataset.bestHour;
+  const worstHour=dataset.worstHour;
+  const topMistakeTag=mistakeTagRows[0]||null;
+  const topPositiveTag=positiveTagRows[0]||null;
+  const reflectionMismatch=reflection?.did_right&&topMistakeTag&&topMistakeTag.count>=2&&stats.totalPnl<0;
+
+  const overallRead=joinInsightLines([
+    rows.length
+      ?`You logged ${rows.length} trade${rows.length!==1?"s":""} on ${formatReflectionDate(date)} and finished ${fmtMoney(stats.totalPnl)} with a ${fmtPct(stats.winRate)} win rate.`
+      :"No trades were logged for this day, so the review is based on your written reflection only.",
+    reflection?.overall_summary?`Your own summary was: "${clipText(reflection.overall_summary,160)}"`:"",
+    bestStrategy&&bestStrategy[1].pnl>0?`${bestStrategy[0]} was your strongest setup on the day at ${fmtMoney(bestStrategy[1].pnl)}.`:"",
+    topMistakeTag&&topMistakeTag.pnl<0?`${topMistakeTag.label} was the clearest drag on the session.`:"",
+  ],"Not enough same-day data yet to build a full read.");
+
+  const strengths=joinInsightLines([
+    reflection?.did_right?`From your reflection: ${reflection.did_right}`:"",
+    topPositiveTag?`${topPositiveTag.label} showed up on ${formatTradeCountLabel(topPositiveTag.count)} and contributed ${fmtMoney(topPositiveTag.pnl)}.`:"",
+    bestStrategy&&bestStrategy[1].pnl>0?`${bestStrategy[0]} produced the best edge with ${fmtPct(bestStrategy[1].winRate)} wins.`:"",
+    bestHour&&bestHour[1].pnl>0?`Your best timing window was ${formatHourLabel(bestHour[0])}, averaging ${fmtMoney(bestHour[1].avgPnl)} per trade.`:"",
+    beforeNoonWins.length>=2?`Your cleaner executions came earlier in the session, with ${beforeNoonWins.length} winning trade${beforeNoonWins.length!==1?"s":""} before noon.`:"",
+  ],"No clear strength pattern stood out beyond the basic trade log yet.");
+
+  const weaknesses=joinInsightLines([
+    reflection?.did_wrong?`From your reflection: ${reflection.did_wrong}`:"",
+    topMistakeTag?`${topMistakeTag.label} appeared on ${formatTradeCountLabel(topMistakeTag.count)} and cost ${fmtMoney(topMistakeTag.pnl)}.`:"",
+    afterNoonLosses.length>=2?`${afterNoonLosses.length} of your losses came after noon, which suggests discipline weakened later in the session.`:"",
+    worstHour&&worstHour[1].pnl<0?`Your weakest window was ${formatHourLabel(worstHour[0])}, where trades averaged ${fmtMoney(worstHour[1].avgPnl)}.`:"",
+    reflectionSignals.some(signal=>signal.key==="fomo")&&topMistakeTag?.label==="Chasing"?"Your notes mention FOMO and the tags confirm chasing behavior in the losses.":"",
+    reflectionMismatch?"Your reflection emphasizes what went right, but the actual trade outcomes were still dominated by repeated mistake tags.":"",
+  ],"No major weakness cluster was obvious beyond the individual losing trades.");
+
+  const tagPatterns=joinInsightLines([
+    topPositiveTag?`Positive tags that helped most: ${formatLabelList(positiveTagRows.slice(0,3).map(row=>row.label))}.`:"",
+    topMistakeTag?`Mistake tags that hurt most: ${formatLabelList(mistakeTagRows.slice(0,3).map(row=>row.label))}.`:"",
+    topPositiveTag&&topMistakeTag?`The gap between ${topPositiveTag.label} on the good trades and ${topMistakeTag.label} on the bad trades is the clearest tag-based contrast from the day.`:"",
+  ],"There were not enough tags on the day to identify a reliable tag-based pattern.");
+
+  const behaviorPatterns=joinInsightLines([
+    rows.some(row=>row.trade.mistakes?.includes("Chasing"))?"Several losing trades were tied to chasing or impulsive entries.":"",
+    rows.some(row=>row.trade.mistakes?.includes("Early Exit")||row.trade.mistakes?.includes("Didn't sell in time")||row.trade.mistakes?.includes("Panic Sold"))?"Exit management showed up as a behavior pattern, either by cutting too fast or not selling decisively enough.":"",
+    rows.some(row=>row.trade.positiveTags?.includes("Waited for Retest"))?"Your best executions were linked to waiting for the retest instead of forcing the first move.":"",
+    rows.some(row=>row.trade.mistakes?.includes("Broke Time Rule (After Noon)"))?"You broke your time rule on at least one trade, which matters because later-session trades were less controlled.":"",
+    rows.some(row=>row.trade.positiveTags?.includes("Position Sized Correctly"))?"Position sizing discipline appeared on the better trades and helped keep execution cleaner.":"",
+    rows.some(row=>row.trade.mistakes?.includes("No Confirmation"))?"A lack of confirmation showed up in the weak trades, which points to entering before the setup had fully proved itself.":"",
+  ],"Trade behavior patterns are still forming for this specific day.");
+
+  const tomorrowFocus=joinInsightLines([
+    reflection?.improve_tomorrow?`Your own plan for tomorrow: ${reflection.improve_tomorrow}`:"",
+    topMistakeTag?`Main focus: eliminate ${topMistakeTag.label.toLowerCase()} first before trying to improve secondary issues.`:"",
+    topPositiveTag?`Keep repeating ${topPositiveTag.label.toLowerCase()} because it showed up on your better executions.`:"",
+    afterNoonLosses.length>=2?"If discipline fades later in the day, tighten your cutoff time and protect capital once momentum slips.":"",
+  ],"Focus on one rule tomorrow: repeat the cleanest setup and cut out the most expensive mistake tag.");
+
+  return{
+    date,
+    ai_summary:overallRead,
+    strengths,
+    weaknesses,
+    tag_patterns:tagPatterns,
+    behavior_patterns:behaviorPatterns,
+    tomorrow_focus:tomorrowFocus,
+  };
+}
+
 function buildDashboardLeakItem(trades,dataset=buildCoachDataset(trades)){
   if(!trades.length)return null;
 
@@ -2732,7 +2941,7 @@ function DashboardStatCard({label,value,sub,detail,icon="spark",tone="neutral",f
   </Card>;
 }
 
-function DailyReflectionCard({reflections,onSave,saving=false}){
+function DailyReflectionCard({trades,reflections,aiReviews,onSave,onGenerateAiReview,saving=false,aiSaving=false}){
   const todayKey=dateToKey(new Date());
   const todayReflection=useMemo(()=>reflections.find(reflection=>reflection.date===todayKey)||null,[reflections,todayKey]);
   const [activeDate,setActiveDate]=useState(todayKey);
@@ -2750,13 +2959,20 @@ function DailyReflectionCard({reflections,onSave,saving=false}){
     improve_tomorrow:"",
   });
   const skipHydrateRef=useRef(false);
+  const [preserveEmptyTodayDraft,setPreserveEmptyTodayDraft]=useState(true);
   const history=useMemo(()=>sortReflectionsDescending(reflections),[reflections]);
   const activeReflection=useMemo(()=>reflections.find(reflection=>reflection.date===activeDate)||null,[reflections,activeDate]);
+  const activeAiReview=useMemo(()=>aiReviews.find(review=>review.date===activeDate)||null,[aiReviews,activeDate]);
+  const sameDayTrades=useMemo(()=>[...trades].filter(trade=>trade.date===activeDate).sort((a,b)=>getTradeDateTime(a)-getTradeDateTime(b)),[trades,activeDate]);
   const isEditingHistoryEntry=activeDate!==todayKey;
 
   useEffect(()=>{
     if(skipHydrateRef.current){
       skipHydrateRef.current=false;
+      return;
+    }
+    if(activeDate===todayKey&&preserveEmptyTodayDraft){
+      setDraft(emptyDraft);
       return;
     }
     setDraft(activeReflection?{
@@ -2765,14 +2981,18 @@ function DailyReflectionCard({reflections,onSave,saving=false}){
       did_wrong:activeReflection.did_wrong||"",
       improve_tomorrow:activeReflection.improve_tomorrow||"",
     }:emptyDraft);
-  },[activeReflection,activeDate,todayKey]);
+  },[activeReflection,activeDate,todayKey,preserveEmptyTodayDraft]);
 
-  const updateField=(key,value)=>setDraft(current=>({...current,[key]:value}));
+  const updateField=(key,value)=>{
+    if(preserveEmptyTodayDraft)setPreserveEmptyTodayDraft(false);
+    setDraft(current=>({...current,[key]:value}));
+  };
   const hasTodayEntry=Boolean(todayReflection);
   const handleSave=async()=>{
     const saved=await onSave?.({date:activeDate,...draft});
     if(saved){
       skipHydrateRef.current=true;
+      setPreserveEmptyTodayDraft(true);
       setDraft(emptyDraft);
       setActiveDate(todayKey);
     }
@@ -2788,6 +3008,7 @@ function DailyReflectionCard({reflections,onSave,saving=false}){
   ];
   const startEditingReflection=reflection=>{
     skipHydrateRef.current=true;
+    setPreserveEmptyTodayDraft(false);
     setActiveDate(reflection.date);
     setDraft({
       overall_summary:reflection.overall_summary||"",
@@ -2798,11 +3019,28 @@ function DailyReflectionCard({reflections,onSave,saving=false}){
   };
   const cancelEditing=()=>{
     skipHydrateRef.current=true;
+    setPreserveEmptyTodayDraft(true);
     setActiveDate(todayKey);
     setDraft(emptyDraft);
   };
+  const generateAiReview=()=>onGenerateAiReview?.({
+    date:activeDate,
+    reflection:{
+      date:activeDate,
+      ...draft,
+    },
+  });
+  const aiSections=[
+    {key:"ai_summary",label:"Overall Read on the Day"},
+    {key:"strengths",label:"What Went Well"},
+    {key:"weaknesses",label:"What Hurt My Performance"},
+    {key:"tag_patterns",label:"Tag-Based Patterns"},
+    {key:"behavior_patterns",label:"Trade Behavior Patterns"},
+    {key:"tomorrow_focus",label:"Best Lesson for Tomorrow"},
+  ];
 
-  return<Card style={{padding:"20px",display:"grid",gap:18,background:`linear-gradient(180deg, ${C.surface}, ${C.surfaceAlt})`,boxShadow:`${C.shadow}, inset 0 0 0 1px rgba(148,163,184,0.10)`}}>
+  return<div style={{display:"grid",gap:14}}>
+  <Card style={{padding:"20px",display:"grid",gap:18,background:`linear-gradient(180deg, ${C.surface}, ${C.surfaceAlt})`,boxShadow:`${C.shadow}, inset 0 0 0 1px rgba(148,163,184,0.10)`}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:16,flexWrap:"wrap"}}>
       <div style={{display:"grid",gap:8}}>
         <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800}}>Daily Trading Reflection</div>
@@ -2894,10 +3132,52 @@ function DailyReflectionCard({reflections,onSave,saving=false}){
           })}
         </div>}
     </div>
-  </Card>;
+  </Card>
+
+  <Card style={{padding:"20px",display:"grid",gap:18,background:`linear-gradient(180deg, ${C.surface}, ${C.surfaceAlt})`,boxShadow:`${C.shadow}, inset 0 0 0 1px rgba(148,163,184,0.10)`}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:16,flexWrap:"wrap"}}>
+      <div style={{display:"grid",gap:8}}>
+        <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800}}>AI Daily Review</div>
+        <div style={{fontSize:24,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif",lineHeight:1.15,letterSpacing:"-0.03em"}}>AI Execution Insight</div>
+        <div style={{fontSize:13,color:C.muted,lineHeight:1.7,maxWidth:780}}>This review combines your written reflection with the same day&apos;s trades, tags, notes, and results to surface what actually helped and hurt your execution.</div>
+      </div>
+      <div style={{display:"grid",gap:8,justifyItems:"end"}}>
+        <Pill label={formatReflectionDate(activeDate)} color={C.teal}/>
+        <div style={{fontSize:12,color:C.muted}}>{sameDayTrades.length} trade{sameDayTrades.length!==1?"s":""} on this day{activeAiReview?.updated_at?` | Updated ${new Date(activeAiReview.updated_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}`:""}</div>
+      </div>
+    </div>
+
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+      <div style={{fontSize:12,color:C.muted,lineHeight:1.7}}>
+        {activeAiReview
+          ?"The saved AI review below is tied to this date and can be regenerated after you update the reflection or the trade log."
+          :"Generate an AI review to compare your written reflection against the actual trade behavior from the same day."}
+      </div>
+      <button
+        type="button"
+        onClick={generateAiReview}
+        disabled={aiSaving||(!sameDayTrades.length&&!Object.values(draft).some(Boolean))}
+        style={{...btnBase(),padding:"11px 16px",borderRadius:999,background:`linear-gradient(180deg, ${C.teal}, #0f9f95)`,color:"#fff",boxShadow:"0 18px 30px rgba(20,184,166,0.20)",opacity:aiSaving||(!sameDayTrades.length&&!Object.values(draft).some(Boolean))?0.7:1}}
+      >
+        {aiSaving?"Generating...":activeAiReview?"Regenerate Review":"Generate AI Review"}
+      </button>
+    </div>
+
+    {!activeAiReview
+      ?<div style={{padding:"16px 18px",borderRadius:18,background:C.surfaceSoft,boxShadow:"inset 0 0 0 1px rgba(148,163,184,0.10)",fontSize:13,color:C.muted,lineHeight:1.7}}>
+        No AI review saved for this day yet.
+      </div>
+      :<div style={{display:"grid",gap:10}}>
+        {aiSections.map(section=><div key={`${activeAiReview.id}-${section.key}`} style={{padding:"14px 15px",borderRadius:16,background:C.surfaceSoft,boxShadow:"inset 0 0 0 1px rgba(148,163,184,0.10)"}}>
+          <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:800,marginBottom:7}}>{section.label}</div>
+          <div style={{fontSize:13,color:C.textSoft,lineHeight:1.75,whiteSpace:"pre-wrap"}}>{activeAiReview[section.key]||"No summary yet."}</div>
+        </div>)}
+      </div>}
+  </Card>
+  </div>;
 }
 
-function DashboardWorkbenchView({trades,reflections,onSaveReflection,reflectionSaving}){
+function DashboardWorkbenchView({trades,reflections,aiReviews,onSaveReflection,onGenerateAiReview,reflectionSaving,aiReviewSaving}){
   const[range,setRange]=useState("ALL");
   const {
     chronologicalTrades,
@@ -2949,7 +3229,7 @@ function DashboardWorkbenchView({trades,reflections,onSaveReflection,reflectionS
   },[trades,range,ACTIVE_THEME]);
 
   if(!trades.length)return<div style={{display:"grid",gap:14,animation:"riseIn .45s ease both"}}>
-    <DailyReflectionCard reflections={reflections} onSave={onSaveReflection} saving={reflectionSaving}/>
+    <DailyReflectionCard trades={trades} reflections={reflections} aiReviews={aiReviews} onSave={onSaveReflection} onGenerateAiReview={onGenerateAiReview} saving={reflectionSaving} aiSaving={aiReviewSaving}/>
     <EmptyState icon="chart" title="Start your first review cycle" message="Log a trade to unlock your command center, core metrics, and recent execution context."/>
   </div>;
 
@@ -3024,7 +3304,7 @@ function DashboardWorkbenchView({trades,reflections,onSaveReflection,reflectionS
         </div>
       </Card>
 
-      <DailyReflectionCard reflections={reflections} onSave={onSaveReflection} saving={reflectionSaving}/>
+      <DailyReflectionCard trades={trades} reflections={reflections} aiReviews={aiReviews} onSave={onSaveReflection} onGenerateAiReview={onGenerateAiReview} saving={reflectionSaving} aiSaving={aiReviewSaving}/>
 
       <Card style={{padding:"18px",display:"grid",gap:14}}>
           <div>
@@ -4893,6 +5173,7 @@ function exportCSV(trades){
 function App(){
   const[trades,setTrades]=useState([]);
   const[reflections,setReflections]=useState([]);
+  const[dailyAiReviews,setDailyAiReviews]=useState([]);
   const[loaded,setLoaded]=useState(false);
   const[view,setView]=useState(getStoredView);
   const[theme,setTheme]=useState(getStoredTheme);
@@ -4907,6 +5188,7 @@ function App(){
   const[authBusy,setAuthBusy]=useState(false);
   const[authError,setAuthError]=useState("");
   const[reflectionSaving,setReflectionSaving]=useState(false);
+  const[aiReviewSaving,setAiReviewSaving]=useState(false);
 
   C=theme==="dark"?DARK_THEME:LIGHT_THEME;
   ACTIVE_THEME=theme;
@@ -4937,7 +5219,7 @@ function App(){
           ?await localSession(savedToken)
           :await apiRequest("/api/auth/session",{token:savedToken});
         if(!active)return;
-        await hydrateSession(savedToken,data.user,data.trades,savedSource,data.reflections);
+        await hydrateSession(savedToken,data.user,data.trades,savedSource,data.reflections,data.daily_ai_reviews);
       }catch(error){
         storage.remove(AUTH_TOKEN_KEY);
         storage.remove(AUTH_SOURCE_KEY);
@@ -4947,6 +5229,7 @@ function App(){
           setUser(null);
           setTrades([]);
           setReflections([]);
+          setDailyAiReviews([]);
           clearActivePanels();
           if(!isServerUnavailableError(error)&&savedSource==="local")setAuthError(error.message||"Please log in again.");
         }
@@ -5014,13 +5297,46 @@ function App(){
     }
   };
 
-  const hydrateSession=async(nextToken,nextUser,nextTrades,nextSource="server",nextReflections=[])=>{
+  const syncDailyAiReview=async({date,reflection})=>{
+    if(!authToken){
+      notify("Your session has ended. Please log in again.",C.red);
+      return false;
+    }
+
+    setAiReviewSaving(true);
+    try{
+      const generatedReview=buildDailyAiReview({
+        date,
+        reflection,
+        trades,
+      });
+      const data=authSource==="local"
+        ?await localSaveDailyAiReview(authToken,generatedReview)
+        :await apiRequest("/api/daily-ai-reviews",{method:"PUT",token:authToken,body:{review:generatedReview}});
+      setDailyAiReviews(normalizeDailyAiReviews(data.daily_ai_reviews,user?.id));
+      notify("AI daily review saved.");
+      return true;
+    }catch(error){
+      notify(
+        isMissingDailyAiReviewRouteError(error)
+          ?"Daily AI review API not available. Restart `npm run dev`, `npm run api`, or `npm run preview` so the backend loads `/api/daily-ai-reviews`."
+          :(error.message||"Unable to generate AI review."),
+        C.red,
+      );
+      return false;
+    }finally{
+      setAiReviewSaving(false);
+    }
+  };
+
+  const hydrateSession=async(nextToken,nextUser,nextTrades,nextSource="server",nextReflections=[],nextDailyAiReviews=[])=>{
     storage.set(AUTH_TOKEN_KEY,nextToken);
     storage.set(AUTH_SOURCE_KEY,nextSource);
     setAuthToken(nextToken);
     setAuthSource(nextSource);
     setUser(nextUser);
     setReflections(normalizeReflections(nextReflections,nextUser?.id));
+    setDailyAiReviews(normalizeDailyAiReviews(nextDailyAiReviews,nextUser?.id));
 
     const serverTrades=normalizeTrades(nextTrades);
     const legacyTrades=loadLegacyTradesFromStorage();
@@ -5070,7 +5386,7 @@ function App(){
         source="local";
       }
 
-      await hydrateSession(data.token,data.user,data.trades,source,data.reflections);
+      await hydrateSession(data.token,data.user,data.trades,source,data.reflections,data.daily_ai_reviews);
       clearActivePanels();
       notify(source==="local"
         ?isServerUnavailableError(loginError)
@@ -5100,7 +5416,7 @@ function App(){
         source="local";
       }
 
-      await hydrateSession(data.token,data.user,data.trades,source,data.reflections);
+      await hydrateSession(data.token,data.user,data.trades,source,data.reflections,data.daily_ai_reviews);
       clearActivePanels();
       notify(source==="local"
         ?`Account created for ${data.user.username}. Using local account mode.`
@@ -5119,6 +5435,7 @@ function App(){
     setAuthSource("");
     setUser(null);
     setReflections([]);
+    setDailyAiReviews([]);
     setAuthMode("login");
     setAuthError("");
     clearActivePanels();
@@ -5170,7 +5487,7 @@ function App(){
   const renderMain=()=>{
     if(isForm)return<TradeForm initial={editing} onSave={saveTrade} onCancel={closeTradeForm}/>;
     if(selected)return<TradeDetail trade={selected} onBack={closeDetailView} onEdit={openTradeEditor} onDelete={deleteTrade}/>;
-    if(view===0)return<DashboardWorkbenchView trades={trades} reflections={reflections} onSaveReflection={syncReflection} reflectionSaving={reflectionSaving}/>;
+    if(view===0)return<DashboardWorkbenchView trades={trades} reflections={reflections} aiReviews={dailyAiReviews} onSaveReflection={syncReflection} onGenerateAiReview={syncDailyAiReview} reflectionSaving={reflectionSaving} aiReviewSaving={aiReviewSaving}/>;
     if(view===1)return<TradeLogView trades={trades} onSelect={openTradeDetail} onNew={openNewTrade} onEdit={openTradeEditor} onImportCSV={handleCSV} onExportCSV={()=>exportCSV(trades)} onResetJournal={resetJournal}/>;
     if(view===2)return<AnalyticsView trades={trades}/>;
     if(view===3)return<AICoach trades={trades}/>;

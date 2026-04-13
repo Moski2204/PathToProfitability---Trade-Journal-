@@ -79,6 +79,24 @@ function normalizeReflectionInput(input) {
   };
 }
 
+function normalizeDailyAiReviewInput(input) {
+  const date = String(input?.date || "").trim();
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new Error("AI review date must be in YYYY-MM-DD format.");
+  }
+
+  return {
+    date,
+    ai_summary: String(input?.ai_summary || "").trim(),
+    strengths: String(input?.strengths || "").trim(),
+    weaknesses: String(input?.weaknesses || "").trim(),
+    tag_patterns: String(input?.tag_patterns || "").trim(),
+    behavior_patterns: String(input?.behavior_patterns || "").trim(),
+    tomorrow_focus: String(input?.tomorrow_focus || "").trim(),
+  };
+}
+
 function sortReflectionsDescending(reflections) {
   return [...reflections].sort((a, b) => {
     const byDate = String(b.date || "").localeCompare(String(a.date || ""));
@@ -89,6 +107,18 @@ function sortReflectionsDescending(reflections) {
 
 function getUserReflections(user) {
   return Array.isArray(user.reflections) ? user.reflections : [];
+}
+
+function sortDailyAiReviewsDescending(reviews) {
+  return [...reviews].sort((a, b) => {
+    const byDate = String(b.date || "").localeCompare(String(a.date || ""));
+    if (byDate !== 0) return byDate;
+    return String(b.updated_at || "").localeCompare(String(a.updated_at || ""));
+  });
+}
+
+function getUserDailyAiReviews(user) {
+  return Array.isArray(user.daily_ai_reviews) ? user.daily_ai_reviews : [];
 }
 
 function upsertUserReflection(user, input) {
@@ -114,6 +144,32 @@ function upsertUserReflection(user, input) {
   };
 
   user.reflections = sortReflectionsDescending([...current, created]);
+  return created;
+}
+
+function upsertUserDailyAiReview(user, input) {
+  const nextInput = normalizeDailyAiReviewInput(input);
+  const now = new Date().toISOString();
+  const current = getUserDailyAiReviews(user);
+  const existing = current.find((entry) => entry.date === nextInput.date);
+
+  if (existing) {
+    Object.assign(existing, nextInput, {
+      updated_at: now,
+    });
+    user.daily_ai_reviews = sortDailyAiReviewsDescending(current);
+    return existing;
+  }
+
+  const created = {
+    id: crypto.randomUUID(),
+    user_id: user.id,
+    ...nextInput,
+    created_at: now,
+    updated_at: now,
+  };
+
+  user.daily_ai_reviews = sortDailyAiReviewsDescending([...current, created]);
   return created;
 }
 
@@ -203,6 +259,7 @@ app.post("/api/auth/register", async (req, res) => {
     passwordHash,
     trades: [],
     reflections: [],
+    daily_ai_reviews: [],
     createdAt: new Date().toISOString(),
   };
 
@@ -214,6 +271,7 @@ app.post("/api/auth/register", async (req, res) => {
     user: serializeUser(user),
     trades: user.trades,
     reflections: getUserReflections(user),
+    daily_ai_reviews: getUserDailyAiReviews(user),
   });
 });
 
@@ -243,6 +301,7 @@ app.post("/api/auth/login", async (req, res) => {
     user: serializeUser(user),
     trades: Array.isArray(user.trades) ? user.trades : [],
     reflections: getUserReflections(user),
+    daily_ai_reviews: getUserDailyAiReviews(user),
   });
 });
 
@@ -251,6 +310,7 @@ app.get("/api/auth/session", authenticate, async (req, res) => {
     user: serializeUser(req.user),
     trades: Array.isArray(req.user.trades) ? req.user.trades : [],
     reflections: getUserReflections(req.user),
+    daily_ai_reviews: getUserDailyAiReviews(req.user),
   });
 });
 
@@ -299,6 +359,32 @@ app.put("/api/reflections", authenticate, async (req, res) => {
   await writeDatabase(database);
 
   return res.json({ reflections: getUserReflections(user) });
+});
+
+app.put("/api/daily-ai-reviews", authenticate, async (req, res) => {
+  const review = req.body?.review;
+
+  if (!review || typeof review !== "object" || Array.isArray(review)) {
+    return res.status(400).json({ error: "AI review payload must be an object." });
+  }
+
+  const database = await readDatabase();
+  const user = database.users.find((entry) => entry.id === req.user.id);
+
+  if (!user) {
+    return res.status(401).json({ error: "Session is no longer valid." });
+  }
+
+  try {
+    upsertUserDailyAiReview(user, review);
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : "Invalid AI review." });
+  }
+
+  user.updatedAt = new Date().toISOString();
+  await writeDatabase(database);
+
+  return res.json({ daily_ai_reviews: getUserDailyAiReviews(user) });
 });
 
 if (isProduction) {
