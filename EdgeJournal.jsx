@@ -4981,7 +4981,7 @@ function ExtremeTradeRow({row,tone,index}){
 
 function ExtremeTradesPanel({title,description,rows,tone}){
   return<div style={{display:"grid",gap:12,alignContent:"start"}}>
-    <div style={{padding:"14px 16px",borderRadius:16,background:`linear-gradient(180deg, ${tone==="win"?"rgba(34,197,94,0.14)":"rgba(239,68,68,0.14)"}, ${C.surface})`,boxShadow:`${C.shadow}, inset 0 0 0 1px ${tone==="win"?"rgba(34,197,94,0.16)":"rgba(239,68,68,0.16)"}`}}>
+    <div style={{padding:"14px 16px",borderRadius:16,background:`linear-gradient(180deg, ${tone==="win"?"rgba(34,197,94,0.14)":"rgba(239,68,68,0.14)"}, ${C.surface})`,boxShadow:`${C.shadow}, inset 0 0 0 1px ${tone==="win"?"rgba(34,197,94,0.16)":"rgba(239,68,68,0.16)"}`,display:"grid",gap:4,justifyItems:"center",textAlign:"center"}}>
       <div style={{fontSize:20,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif",marginBottom:4}}>{title}</div>
       <div style={{fontSize:13,color:C.muted,lineHeight:1.65}}>{description}</div>
     </div>
