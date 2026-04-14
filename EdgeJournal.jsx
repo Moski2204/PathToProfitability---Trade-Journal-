@@ -4430,6 +4430,8 @@ function AnalyticsView({trades}){
     strengthRows,
     mistakePeak,
     strengthPeak,
+    biggestWins,
+    biggestLosses,
   }=useMemo(()=>{
     const ordered=[...trades].sort((a,b)=>getTradeDateTime(a)-getTradeDateTime(b));
     const nextPnls=ordered.map(calcPnl);
@@ -4455,6 +4457,16 @@ function AnalyticsView({trades}){
       .sort((a,b)=>a.pnl-b.pnl||b.count-a.count||a.label.localeCompare(b.label));
     const nextStrengthRows=buildBehaviorRows(behaviorTrades,"positiveTags")
       .sort((a,b)=>b.pnl-a.pnl||b.count-a.count||a.label.localeCompare(b.label));
+    const extremeTradeRows=ordered.map((trade,index)=>{
+      const entryNotional=calcEntryNotional(trade);
+      return{
+        trade,
+        pnl:nextPnls[index],
+        entryNotional,
+        roi:entryNotional?nextPnls[index]/entryNotional:null,
+        hold:calcDur(trade),
+      };
+    });
 
     return{
       orderedTrades:ordered,
@@ -4470,6 +4482,14 @@ function AnalyticsView({trades}){
       strengthRows:nextStrengthRows,
       mistakePeak:Math.max(1,...nextMistakeRows.map(row=>Math.max(1,Math.abs(row.pnl)))),
       strengthPeak:Math.max(1,...nextStrengthRows.map(row=>Math.max(1,Math.abs(row.pnl)))),
+      biggestWins:extremeTradeRows
+        .filter(row=>row.pnl>0)
+        .sort((a,b)=>b.pnl-a.pnl||((b.roi??-Infinity)-(a.roi??-Infinity)))
+        .slice(0,5),
+      biggestLosses:extremeTradeRows
+        .filter(row=>row.pnl<0)
+        .sort((a,b)=>a.pnl-b.pnl||((a.roi??Infinity)-(b.roi??Infinity)))
+        .slice(0,5),
     };
   },[trades,behaviorRange,ACTIVE_THEME]);
 
@@ -4760,6 +4780,27 @@ function AnalyticsView({trades}){
     </div>
 
     <Card style={{padding:"20px",display:"grid",gap:16}}>
+      <div style={{display:"grid",gap:8,justifyItems:"center",textAlign:"center"}}>
+        <div style={{fontSize:24,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif",lineHeight:1.18,letterSpacing:"-0.03em"}}>Biggest Wins and Losses</div>
+        <div style={{fontSize:14,color:C.muted,lineHeight:1.75,maxWidth:780}}>Largest winning trades are sorted from biggest win to smallest win. Largest losing trades are sorted from biggest loss to smallest loss, with both dollar impact and ROI shown for fast comparison.</div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",gap:16}}>
+        <ExtremeTradesPanel
+          title="Biggest Wins"
+          description="Highest profit trades across the journal, ranked by total dollars made."
+          rows={biggestWins}
+          tone="win"
+        />
+        <ExtremeTradesPanel
+          title="Biggest Losses"
+          description="Largest drawdowns across the journal, ranked by total dollars lost."
+          rows={biggestLosses}
+          tone="loss"
+        />
+      </div>
+    </Card>
+
+    <Card style={{padding:"20px",display:"grid",gap:16}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:14,flexWrap:"wrap"}}>
         <div style={{display:"grid",gap:8}}>
           <SLabel>Behavior Panel</SLabel>
@@ -4901,6 +4942,54 @@ function StreakView({pnls,trades}){
     <Metric label="Max Loss Streak" value={`${maxL}L`} color={C.red} icon="arrowDown" small/>
     <Metric label="Total Wins" value={w} color={C.green} icon="arrowUp" small/>
     <Metric label="Total Losses" value={l} color={C.red} icon="arrowDown" small/>
+  </div>;
+}
+
+function ExtremeTradeRow({row,tone,index}){
+  const accent=tone==="win"?C.green:C.red;
+  const timeRange=formatTimeRange(row.trade.entries[0]?.time,row.trade.exits[0]?.time);
+  return<div style={{padding:"16px 16px 14px",borderRadius:18,background:C.surfaceAlt,boxShadow:`${C.shadow}, inset 0 0 0 1px ${tone==="win"?"rgba(34,197,94,0.12)":"rgba(239,68,68,0.12)"}`,display:"grid",gap:12}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:14}}>
+      <div style={{display:"grid",gap:6,minWidth:0}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+          <div style={{width:30,height:30,borderRadius:12,display:"flex",alignItems:"center",justifyContent:"center",background:`${accent}15`,color:accent,fontSize:13,fontWeight:900,flex:"0 0 auto"}}>
+            {index+1}
+          </div>
+          <div style={{fontSize:18,fontWeight:800,color:C.text,lineHeight:1.2,fontFamily:"'Sora','Manrope',sans-serif"}}>{row.trade.symbol}</div>
+          <Pill label={getDirectionLabel(row.trade.direction)} color={getDirectionColor(row.trade.direction)} sm/>
+          <Pill label={row.trade.strategy} color={C.purple} sm/>
+        </div>
+        <div style={{fontSize:12,color:C.muted,lineHeight:1.7}}>
+          {row.trade.date}{timeRange?` | ${timeRange}`:""} | {row.trade.market}
+        </div>
+      </div>
+      <div style={{textAlign:"right",display:"grid",gap:4,justifyItems:"end",flex:"0 0 auto"}}>
+        <div style={{fontSize:20,fontWeight:900,color:accent,lineHeight:1,fontFamily:"'Sora','Manrope',sans-serif",letterSpacing:"-0.02em"}}>{fmtMoney(row.pnl)}</div>
+        <div style={{fontSize:13,fontWeight:800,color:row.roi===null?C.dim:accent}}>
+          {row.roi===null?"No ROI":fmtPct(row.roi)}
+        </div>
+      </div>
+    </div>
+    <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+        <Pill label={row.entryNotional>0?`Entry $${row.entryNotional.toFixed(0)}`:"Entry N/A"} color={C.teal} sm/>
+        {row.hold!==null&&<Pill label={`${row.hold} min hold`} color="transparent" sm/>}
+      </div>
+    </div>
+  </div>;
+}
+
+function ExtremeTradesPanel({title,description,rows,tone}){
+  return<div style={{display:"grid",gap:12,alignContent:"start"}}>
+    <div style={{padding:"14px 16px",borderRadius:16,background:`linear-gradient(180deg, ${tone==="win"?"rgba(34,197,94,0.14)":"rgba(239,68,68,0.14)"}, ${C.surface})`,boxShadow:`${C.shadow}, inset 0 0 0 1px ${tone==="win"?"rgba(34,197,94,0.16)":"rgba(239,68,68,0.16)"}`}}>
+      <div style={{fontSize:20,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif",marginBottom:4}}>{title}</div>
+      <div style={{fontSize:13,color:C.muted,lineHeight:1.65}}>{description}</div>
+    </div>
+    {rows.length
+      ?rows.map((row,index)=><ExtremeTradeRow key={`${tone}-${row.trade.id}`} row={row} tone={tone} index={index}/>)
+      :<div style={{padding:"18px 20px",borderRadius:18,background:C.surfaceAlt,boxShadow:`inset 0 0 0 1px ${tone==="win"?"rgba(34,197,94,0.10)":"rgba(239,68,68,0.10)"}`,fontSize:14,color:C.muted,lineHeight:1.75}}>
+        No {tone==="win"?"winning":"losing"} trades to rank yet.
+      </div>}
   </div>;
 }
 
