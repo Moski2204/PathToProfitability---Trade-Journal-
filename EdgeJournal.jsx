@@ -1916,6 +1916,8 @@ function TimeInput12h({value,onChange}){
 function TradeCard({trade,pnl,onSelect,onEdit}){
   const [notesOpen,setNotesOpen]=useState(false);
   const dur=calcDur(trade);
+  const entryNotional=calcEntryNotional(trade);
+  const returnPct=entryNotional?pnl/entryNotional:null;
   const timeRange=formatTimeRange(trade.entries[0]?.time,trade.exits[0]?.time);
   const pre=cleanTradeNoteText(trade.preTrade);
   const post=cleanTradeNoteText(trade.postTrade);
@@ -1966,7 +1968,10 @@ function TradeCard({trade,pnl,onSelect,onEdit}){
           </div>
         </div>
         <div style={{textAlign:"right"}}>
-          <div style={{fontSize:28,fontWeight:800,color:pnl>=0?C.green:C.red,fontFamily:"'Sora','Manrope',sans-serif"}}>{pnl>=0?"+$":"-$"}{Math.abs(pnl).toFixed(0)}</div>
+          <div style={{display:"flex",alignItems:"baseline",justifyContent:"flex-end",gap:10,flexWrap:"wrap"}}>
+            <div style={{fontSize:28,fontWeight:800,color:pnl>=0?C.green:C.red,fontFamily:"'Sora','Manrope',sans-serif"}}>{pnl>=0?"+$":"-$"}{Math.abs(pnl).toFixed(0)}</div>
+            {returnPct!==null&&<div style={{fontSize:16,fontWeight:800,color:returnPct>=0?C.green:C.red,fontFamily:"'Sora','Manrope',sans-serif"}}>{fmtPct(returnPct)}</div>}
+          </div>
           <div style={{fontSize:12,color:C.muted}}>{dur!==null?`${dur} min hold`:"Duration unavailable"}</div>
         </div>
       </div>
