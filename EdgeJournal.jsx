@@ -161,6 +161,8 @@ const VIEW_STORAGE_KEY="ej_last_view_v1";
 const LOCAL_AUTH_DB_KEY="ej_local_auth_db_v1";
 const LOCAL_JWT_SECRET="moskiptp-local-jwt-secret";
 const THEME_STORAGE_KEY="ej_theme_v1";
+const ACCOUNT_LEDGER_STORAGE_PREFIX="ej_account_ledger_v1";
+const ACCOUNT_TRANSACTION_TYPES=["deposit","withdrawal"];
 
 const storage={
   get(key){
@@ -223,6 +225,34 @@ function loadLocalAuthDb(){
 function saveLocalAuthDb(db){
   const saved=storage.set(LOCAL_AUTH_DB_KEY,JSON.stringify({users:Array.isArray(db?.users)?db.users:[]}));
   if(!saved)throw new Error("Browser storage is full. Start the journal server to save screenshot-heavy trades reliably.");
+}
+
+function getStoredAccountLedgerKey(userId){
+  return`${ACCOUNT_LEDGER_STORAGE_PREFIX}:${String(userId||"guest").trim()}`;
+}
+
+function loadStoredAccountLedger(userId){
+  if(!userId)return{startingBalance:0,transactions:[]};
+  try{
+    const raw=storage.get(getStoredAccountLedgerKey(userId)).value;
+    const parsed=raw?JSON.parse(raw):{};
+    return{
+      startingBalance:normalizeStartingBalance(parsed.startingBalance??parsed.starting_balance),
+      transactions:normalizeAccountTransactions(parsed.transactions??parsed.account_transactions,userId),
+    };
+  }catch{
+    return{startingBalance:0,transactions:[]};
+  }
+}
+
+function saveStoredAccountLedger(userId,{startingBalance,transactions}){
+  if(!userId)return false;
+  const saved=storage.set(getStoredAccountLedgerKey(userId),JSON.stringify({
+    startingBalance:normalizeStartingBalance(startingBalance),
+    transactions:normalizeAccountTransactions(transactions,userId),
+  }));
+  if(!saved)throw new Error("Browser storage is full. Unable to save account transactions locally.");
+  return true;
 }
 
 function sortReflectionsDescending(reflections){
@@ -301,6 +331,104 @@ function normalizeDailyAiReviews(reviews,userId=""){
     }
   });
   return sortDailyAiReviewsDescending(Object.values(byDate));
+}
+
+function roundCurrencyValue(value){
+  const numeric=Number(value);
+  if(!Number.isFinite(numeric))return 0;
+  return Math.round(numeric*100)/100;
+}
+
+function normalizeStartingBalance(value){
+  const parsed=parseMaybeNumber(value);
+  return parsed===null?0:roundCurrencyValue(parsed);
+}
+
+function normalizeAccountTransactionType(value,amount=0){
+  const normalized=String(value||"").trim().toLowerCase();
+  if(ACCOUNT_TRANSACTION_TYPES.includes(normalized))return normalized;
+  return Number(amount)<0?"withdrawal":"deposit";
+}
+
+function getSignedTransactionAmount(transaction){
+  const type=normalizeAccountTransactionType(transaction?.type,transaction?.amount);
+  const amount=Math.abs(roundCurrencyValue(transaction?.amount));
+  return type==="withdrawal"?-amount:amount;
+}
+
+function sortAccountTransactionsDescending(transactions){
+  return [...transactions].sort((a,b)=>
+    String(b.date||"").localeCompare(String(a.date||""))||
+    String(b.updated_at||"").localeCompare(String(a.updated_at||""))||
+    String(a.account||"").localeCompare(String(b.account||""))
+  );
+}
+
+function normalizeAccountTransaction(transaction,userId=""){
+  if(!transaction||typeof transaction!=="object")return null;
+  const account=String(transaction.account||"").trim();
+  const date=String(transaction.date||"").trim();
+  const amount=parseMaybeNumber(transaction.amount);
+
+  if(!account||!/^\d{4}-\d{2}-\d{2}$/.test(date)||amount===null)return null;
+
+  const createdAt=String(transaction.created_at||transaction.createdAt||new Date().toISOString());
+  const updatedAt=String(transaction.updated_at||transaction.updatedAt||createdAt);
+
+  return{
+    id:String(transaction.id||`account-transaction-${crypto.randomUUID?.()||Date.now()}`),
+    user_id:String(transaction.user_id||transaction.userId||userId||""),
+    account,
+    date,
+    type:normalizeAccountTransactionType(transaction.type,amount),
+    amount:Math.abs(roundCurrencyValue(amount)),
+    created_at:createdAt,
+    updated_at:updatedAt,
+  };
+}
+
+function normalizeAccountTransactions(transactions,userId=""){
+  const byId={};
+  (Array.isArray(transactions)?transactions:[]).forEach(transaction=>{
+    const normalized=normalizeAccountTransaction(transaction,userId);
+    if(!normalized)return;
+    const existing=byId[normalized.id];
+    if(!existing||String(normalized.updated_at||"").localeCompare(String(existing.updated_at||""))>0){
+      byId[normalized.id]=normalized;
+    }
+  });
+  return sortAccountTransactionsDescending(Object.values(byId));
+}
+
+function calcCashFlowTotal(transactions){
+  return roundCurrencyValue(
+    normalizeAccountTransactions(transactions).reduce((sum,transaction)=>sum+getSignedTransactionAmount(transaction),0)
+  );
+}
+
+function calcTradesPnlTotal(trades){
+  return roundCurrencyValue((Array.isArray(trades)?trades:[]).reduce((sum,trade)=>sum+calcPnl(trade),0));
+}
+
+function calcLedgerSummary(startingBalance,transactions,trades=[]){
+  const netDeposits=calcCashFlowTotal(transactions);
+  const allTimeReturn=calcTradesPnlTotal(trades);
+  const currentValue=roundCurrencyValue(netDeposits+allTimeReturn);
+  const allTimeRoiPct=Math.abs(netDeposits)>0.005
+    ?allTimeReturn/netDeposits
+    :null;
+
+  return{
+    startingBalance:normalizeStartingBalance(startingBalance),
+    netDeposits,
+    allTimeReturn,
+    currentValue,
+    allTimeRoiPct,
+  };
+}
+
+function calcCurrentCashBalance(startingBalance,transactions,trades=[]){
+  return calcLedgerSummary(startingBalance,transactions,trades).currentValue;
 }
 
 function encodeBase64Url(value){
@@ -403,6 +531,10 @@ function isMissingDailyAiReviewRouteError(error){
   return /\bnot found\b/i.test(String(error?.message||""));
 }
 
+function isMissingAccountTransactionsRouteError(error){
+  return /\bnot found\b/i.test(String(error?.message||""));
+}
+
 async function localRegister({username,email,password}){
   const db=loadLocalAuthDb();
   const trimmedUsername=String(username||"").trim();
@@ -419,6 +551,8 @@ async function localRegister({username,email,password}){
     trades:[],
     reflections:[],
     daily_ai_reviews:[],
+    account_transactions:[],
+    starting_balance:0,
     createdAt:new Date().toISOString(),
   };
 
@@ -431,6 +565,8 @@ async function localRegister({username,email,password}){
     trades:user.trades,
     reflections:user.reflections,
     daily_ai_reviews:user.daily_ai_reviews,
+    account_transactions:user.account_transactions,
+    starting_balance:user.starting_balance,
   };
 }
 
@@ -450,6 +586,8 @@ async function localLogin({identifier,password}){
     trades:Array.isArray(user.trades)?user.trades:[],
     reflections:normalizeReflections(user.reflections,user.id),
     daily_ai_reviews:normalizeDailyAiReviews(user.daily_ai_reviews,user.id),
+    account_transactions:normalizeAccountTransactions(user.account_transactions,user.id),
+    starting_balance:normalizeStartingBalance(user.starting_balance),
   };
 }
 
@@ -465,6 +603,8 @@ async function localSession(token){
     trades:Array.isArray(user.trades)?user.trades:[],
     reflections:normalizeReflections(user.reflections,user.id),
     daily_ai_reviews:normalizeDailyAiReviews(user.daily_ai_reviews,user.id),
+    account_transactions:normalizeAccountTransactions(user.account_transactions,user.id),
+    starting_balance:normalizeStartingBalance(user.starting_balance),
   };
 }
 
@@ -558,6 +698,24 @@ async function localSaveDailyAiReview(token,review){
   saveLocalAuthDb(db);
 
   return{daily_ai_reviews:user.daily_ai_reviews};
+}
+
+async function localSaveAccountLedger(token,{startingBalance,transactions}){
+  const payload=await verifyLocalToken(token);
+  const db=loadLocalAuthDb();
+  const user=db.users.find(entry=>entry.id===payload.sub);
+
+  if(!user)throw new Error("Session is no longer valid.");
+
+  user.starting_balance=normalizeStartingBalance(startingBalance);
+  user.account_transactions=normalizeAccountTransactions(transactions,user.id);
+  user.updatedAt=new Date().toISOString();
+  saveLocalAuthDb(db);
+
+  return{
+    starting_balance:user.starting_balance,
+    account_transactions:user.account_transactions,
+  };
 }
 
 function getApiCandidates(path){
@@ -990,6 +1148,15 @@ function avg(nums){
 
 function fmtMoney(n,decimals=0){
   return`${n>=0?"+$":"-$"}${Math.abs(n).toFixed(decimals)}`;
+}
+
+function fmtCash(n,decimals=2,{showPlus=false}={}){
+  const amount=roundCurrencyValue(n);
+  return`${amount<0?"-":showPlus&&amount>0?"+":""}$${Math.abs(amount).toFixed(decimals)}`;
+}
+
+function fmtUsd(n,decimals=2,options={}){
+  return`${fmtCash(n,decimals,options)} USD`;
 }
 
 function fmtPct(n){
@@ -1618,6 +1785,321 @@ function EmptyState({icon="chart",title,message,action}){
     <div style={{fontSize:14,color:C.muted,lineHeight:1.7,maxWidth:480,margin:"0 auto"}}>{message}</div>
     {action&&<div style={{marginTop:18}}>{action}</div>}
   </Card>;
+}
+
+function AccountTransactionsModal({open,user,tradesCount,startingBalance,transactions,trades,onClose,onSaveLedger}){
+  const formCardRef=useRef(null);
+  const createBlankTransaction=()=>({
+    id:"",
+    account:"",
+    type:"deposit",
+    date:new Date().toISOString().slice(0,10),
+    amount:"",
+  });
+  const[form,setForm]=useState(createBlankTransaction);
+  const[error,setError]=useState("");
+  const[busy,setBusy]=useState(false);
+  const ledgerSummary=useMemo(()=>calcLedgerSummary(startingBalance,transactions,trades),[startingBalance,transactions,trades]);
+  const isEditing=Boolean(form.id);
+
+  useEffect(()=>{
+    if(!open)return;
+    setForm(createBlankTransaction());
+    setError("");
+  },[open,user?.id]);
+
+  useEffect(()=>{
+    if(!open||typeof window==="undefined")return undefined;
+    const handleKeyDown=event=>{
+      if(event.key==="Escape")onClose();
+    };
+    window.addEventListener("keydown",handleKeyDown);
+    return()=>window.removeEventListener("keydown",handleKeyDown);
+  },[open,onClose]);
+
+  useEffect(()=>{
+    if(!open||!import.meta.env.DEV)return;
+    const expectedValue=roundCurrencyValue(ledgerSummary.netDeposits+ledgerSummary.allTimeReturn);
+    if(Math.abs(expectedValue-ledgerSummary.currentValue)>0.005){
+      console.error("Ledger summary formula mismatch:",{
+        netDeposits:ledgerSummary.netDeposits,
+        allTimeReturn:ledgerSummary.allTimeReturn,
+        currentValue:ledgerSummary.currentValue,
+        expectedValue,
+      });
+    }
+  },[open,ledgerSummary]);
+
+  if(!open||typeof document==="undefined")return null;
+
+  const updateForm=(key,value)=>setForm(current=>({...current,[key]:value}));
+  const resetForm=()=>setForm(createBlankTransaction());
+
+  const handleTransactionSubmit=async event=>{
+    event.preventDefault();
+    const account=String(form.account||"").trim();
+    const type=normalizeAccountTransactionType(form.type);
+    const date=String(form.date||"").trim();
+    const amount=parseMaybeNumber(form.amount);
+
+    if(!account){
+      setError("Enter an account name.");
+      return;
+    }
+    if(!ACCOUNT_TRANSACTION_TYPES.includes(type)){
+      setError("Choose a transaction type.");
+      return;
+    }
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(date)){
+      setError("Choose a valid transaction date.");
+      return;
+    }
+    if(amount===null||roundCurrencyValue(amount)===0){
+      setError("Enter a valid amount greater than zero.");
+      return;
+    }
+
+    const now=new Date().toISOString();
+    const existingTransaction=transactions.find(entry=>entry.id===form.id);
+    const transaction={
+      id:form.id||`account-transaction-${crypto.randomUUID?.()||Date.now()}`,
+      user_id:user?.id||"",
+      account,
+      type,
+      date,
+      amount:Math.abs(roundCurrencyValue(amount)),
+      created_at:existingTransaction?.created_at||now,
+      updated_at:now,
+    };
+    const nextTransactions=form.id
+      ?transactions.map(entry=>entry.id===form.id?transaction:entry)
+      :[transaction,...transactions];
+
+    setBusy(true);
+    setError("");
+    const saved=await onSaveLedger(
+      startingBalance,
+      nextTransactions,
+      form.id?"Transaction updated.":"Transaction added.",
+    );
+    if(saved)resetForm();
+    else setError("Unable to save transaction.");
+    setBusy(false);
+  };
+
+  const handleEditTransaction=transaction=>{
+    setError("");
+    setForm({
+      id:transaction.id,
+      account:transaction.account,
+      type:normalizeAccountTransactionType(transaction.type,transaction.amount),
+      date:transaction.date,
+      amount:String(transaction.amount),
+    });
+    if(typeof window!=="undefined"){
+      window.requestAnimationFrame(()=>formCardRef.current?.scrollIntoView({block:"center",behavior:"smooth"}));
+    }
+  };
+
+  const handleDeleteTransaction=async transactionId=>{
+    setBusy(true);
+    setError("");
+    const saved=await onSaveLedger(
+      startingBalance,
+      transactions.filter(transaction=>transaction.id!==transactionId),
+      "Transaction deleted.",
+      C.red,
+    );
+    if(saved&&form.id===transactionId)resetForm();
+    if(!saved)setError("Unable to delete transaction.");
+    setBusy(false);
+  };
+
+  return createPortal(<div
+    onClick={onClose}
+    style={{
+      position:"fixed",
+      inset:0,
+      zIndex:160,
+      background:"rgba(8,17,31,0.42)",
+      backdropFilter:"blur(8px)",
+      display:"flex",
+      alignItems:"flex-start",
+      justifyContent:"center",
+      overflowY:"auto",
+      padding:"28px 16px 40px",
+    }}
+  >
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="account-transactions-title"
+      onClick={event=>event.stopPropagation()}
+      style={{
+        width:"min(1040px, 100%)",
+        maxHeight:"96vh",
+        display:"grid",
+        gridTemplateRows:"auto minmax(0,1fr)",
+        background:C.surface,
+        borderRadius:24,
+        boxShadow:C.shadowLg,
+        overflow:"hidden",
+        border:`1px solid ${C.border}`,
+        margin:"0 auto",
+      }}
+    >
+      <div style={{padding:"20px 22px 18px",borderBottom:`1px solid ${C.border}`,background:`linear-gradient(180deg, ${C.surface}, ${C.surfaceAlt})`,display:"grid",gap:16}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr auto 1fr",alignItems:"start",gap:16}}>
+          <div/>
+          <div style={{textAlign:"center"}}>
+            <div id="account-transactions-title" style={{fontSize:18,color:C.accentStrong,fontWeight:900,textTransform:"uppercase",letterSpacing:"0.16em",marginBottom:10}}>Account Transactions</div>
+            <div style={{fontSize:13,color:C.muted}}>
+              {user?.username||"Trader"} • {tradesCount} trades saved
+            </div>
+          </div>
+          <div style={{display:"flex",justifyContent:"flex-end"}}>
+            <button type="button" onClick={onClose} style={{...btnBase(),padding:"10px 14px",fontWeight:800}}>
+              Close
+            </button>
+          </div>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:12}}>
+          <div style={{padding:"14px 16px",borderRadius:18,background:C.surface,boxShadow:C.shadow}}>
+            <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800,marginBottom:6}}>Net Deposits</div>
+            <div style={{fontSize:28,fontWeight:800,color:ledgerSummary.netDeposits>=0?C.teal:C.red,fontFamily:"'Sora','Manrope',sans-serif"}}>{fmtUsd(ledgerSummary.netDeposits)}</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:6}}>Saved deposits and withdrawals only.</div>
+          </div>
+          <div style={{padding:"14px 16px",borderRadius:18,background:C.surface,boxShadow:C.shadow}}>
+            <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800,marginBottom:6}}>All-Time Return</div>
+            <div style={{fontSize:28,fontWeight:800,color:ledgerSummary.allTimeReturn>=0?C.green:C.red,fontFamily:"'Sora','Manrope',sans-serif"}}>{fmtUsd(ledgerSummary.allTimeReturn,2,{showPlus:true})}</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:6}}>Trade gains and losses only.</div>
+          </div>
+          <div style={{padding:"14px 16px",borderRadius:18,background:C.surface,boxShadow:C.shadow}}>
+            <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800,marginBottom:6}}>Current Value</div>
+            <div style={{display:"flex",alignItems:"baseline",gap:10,flexWrap:"wrap"}}>
+              <div style={{fontSize:28,fontWeight:800,color:"#fff",fontFamily:"'Sora','Manrope',sans-serif"}}>{fmtUsd(ledgerSummary.currentValue)}</div>
+              <div style={{fontSize:14,fontWeight:800,color:ledgerSummary.allTimeRoiPct===null?C.muted:ledgerSummary.allTimeRoiPct>=0?C.green:C.red}}>
+                {ledgerSummary.allTimeRoiPct===null?"ROI N/A":`ROI ${fmtPct(ledgerSummary.allTimeRoiPct)}`}
+              </div>
+            </div>
+            <div style={{fontSize:12,color:C.muted,marginTop:6}}>Net Deposits + All-Time Return.</div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{padding:"22px 24px 28px",overflowY:"auto",minHeight:0,display:"grid",alignContent:"start",gap:18}}>
+        <Card style={{padding:"18px 18px 22px",background:`linear-gradient(180deg, ${C.surface}, ${C.surfaceAlt})`,overflow:"visible"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap",marginBottom:12}}>
+            <SLabel>Brokerage Summary</SLabel>
+            <Pill label={`${transactions.length} transaction${transactions.length!==1?"s":""}`} color={C.teal} sm/>
+          </div>
+          <div style={{fontSize:13,color:C.muted,lineHeight:1.7}}>
+            Current Value is calculated automatically from your saved cash transactions and all trade results. Manual balance overrides are not used.
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:12}}>
+            <Pill label={`Net Deposits ${fmtUsd(ledgerSummary.netDeposits)}`} color={ledgerSummary.netDeposits>=0?C.teal:C.red} sm/>
+            <Pill label={`All-Time Return ${fmtUsd(ledgerSummary.allTimeReturn,2,{showPlus:true})}`} color={ledgerSummary.allTimeReturn>=0?C.green:C.red} sm/>
+            <Pill label={`Current Value ${fmtUsd(ledgerSummary.currentValue)}`} color="#fff" sm/>
+          </div>
+        </Card>
+
+        <div ref={formCardRef}>
+          <Card style={{padding:"18px 18px 24px",overflow:"visible"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap",marginBottom:12}}>
+              <SLabel>{isEditing?"Edit Transaction":"Add Transaction"}</SLabel>
+              <div style={{fontSize:12,color:C.muted}}>Choose deposit or withdrawal. Amount stays positive.</div>
+            </div>
+            <form onSubmit={handleTransactionSubmit} style={{display:"grid",gap:12}}>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,alignItems:"center"}}>
+                <input
+                  value={form.account}
+                  onChange={event=>updateForm("account",event.target.value)}
+                  placeholder="Account"
+                  style={inp()}
+                />
+                <select
+                  value={form.type}
+                  onChange={event=>updateForm("type",event.target.value)}
+                  style={inp()}
+                >
+                  <option value="deposit">Deposit</option>
+                  <option value="withdrawal">Withdrawal</option>
+                </select>
+                <input
+                  value={form.date}
+                  onChange={event=>updateForm("date",event.target.value)}
+                  type="date"
+                  style={inp()}
+                />
+                <input
+                  value={form.amount}
+                  onChange={event=>updateForm("amount",event.target.value)}
+                  type="number"
+                  step="0.01"
+                  inputMode="decimal"
+                  placeholder="Amount"
+                  style={inp()}
+                />
+              </div>
+              <div style={{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap"}}>
+                {isEditing&&<button type="button" onClick={resetForm} style={{...btnBase(),padding:"12px 14px"}}>Cancel</button>}
+                <button
+                  type="submit"
+                  disabled={busy}
+                  style={{...btnBase(),padding:"12px 14px",background:C.accent,color:"#fff",boxShadow:"0 16px 30px rgba(59,130,246,0.20)",display:"inline-flex",alignItems:"center",gap:8}}
+                >
+                  <Icon name={isEditing?"pencil":"plus"} size={14} color="#fff"/>
+                  {isEditing?"Save":"Add"}
+                </button>
+              </div>
+              {error&&<div style={{fontSize:12,color:C.red,fontWeight:700}}>{error}</div>}
+            </form>
+          </Card>
+        </div>
+
+        <Card style={{padding:"18px 18px 18px",minHeight:320,overflow:"visible"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap",marginBottom:12}}>
+            <SLabel>Saved Transactions</SLabel>
+            <div style={{fontSize:12,color:C.muted}}>Click edit to update an entry in place.</div>
+          </div>
+          {!transactions.length
+            ?<div style={{padding:"18px 4px 12px",fontSize:13,color:C.muted}}>No transactions saved yet. Add your first ledger entry above.</div>
+            :<div style={{overflow:"auto",minHeight:220,maxHeight:"52vh",paddingBottom:8,borderRadius:16,background:C.surfaceAlt}}>
+              <table style={{width:"100%",borderCollapse:"collapse",minWidth:760}}>
+                <thead>
+                  <tr>
+                    {["Account","Type","Date","Amount","Actions"].map(label=><th key={label} style={{textAlign:label==="Amount"?"right":"left",padding:"14px 10px 12px",fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800,background:C.surfaceAlt,position:"sticky",top:0,zIndex:1}}>{label}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {transactions.map(transaction=><tr key={transaction.id} style={{borderTop:`1px solid ${C.border}`}}>
+                    <td style={{padding:"14px 10px",fontSize:13,fontWeight:700,color:C.text}}>{transaction.account}</td>
+                    <td style={{padding:"14px 10px",fontSize:13}}>
+                      <Pill label={normalizeAccountTransactionType(transaction.type,transaction.amount)==="deposit"?"Deposit":"Withdrawal"} color={normalizeAccountTransactionType(transaction.type,transaction.amount)==="deposit"?C.teal:C.amber} sm/>
+                    </td>
+                    <td style={{padding:"14px 10px",fontSize:13,color:C.muted}}>{parseDateOnly(transaction.date)?.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})||transaction.date}</td>
+                    <td style={{padding:"14px 10px",fontSize:13,fontWeight:800,color:getSignedTransactionAmount(transaction)>=0?C.green:C.red,textAlign:"right"}}>{fmtCash(getSignedTransactionAmount(transaction),2,{showPlus:true})}</td>
+                    <td style={{padding:"14px 10px"}}>
+                      <div style={{display:"flex",justifyContent:"flex-end",gap:8}}>
+                        <button type="button" onClick={()=>handleEditTransaction(transaction)} style={{...btnBase(),padding:"8px 12px",display:"inline-flex",alignItems:"center",gap:6}}>
+                          <Icon name="pencil" size={13} color={C.textSoft}/>
+                          Edit
+                        </button>
+                        <button type="button" onClick={()=>handleDeleteTransaction(transaction.id)} disabled={busy} style={{...btnBase(),padding:"8px 12px",background:C.redBg,color:C.red,display:"inline-flex",alignItems:"center",gap:6}}>
+                          <Icon name="trash" size={13} color={C.red}/>
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>)}
+                </tbody>
+              </table>
+            </div>}
+        </Card>
+      </div>
+    </div>
+  </div>,document.body);
 }
 
 class ViewErrorBoundary extends Component{
@@ -5268,12 +5750,15 @@ function App(){
   const[trades,setTrades]=useState([]);
   const[reflections,setReflections]=useState([]);
   const[dailyAiReviews,setDailyAiReviews]=useState([]);
+  const[accountTransactions,setAccountTransactions]=useState([]);
+  const[startingBalance,setStartingBalance]=useState(0);
   const[loaded,setLoaded]=useState(false);
   const[view,setView]=useState(getStoredView);
   const[theme,setTheme]=useState(getStoredTheme);
   const[selected,setSelected]=useState(null);
   const[editing,setEditing]=useState(null);
   const[showForm,setShowForm]=useState(false);
+  const[accountModalOpen,setAccountModalOpen]=useState(false);
   const[toast,setToast]=useState(null);
   const[user,setUser]=useState(null);
   const[authToken,setAuthToken]=useState("");
@@ -5313,7 +5798,7 @@ function App(){
           ?await localSession(savedToken)
           :await apiRequest("/api/auth/session",{token:savedToken});
         if(!active)return;
-        await hydrateSession(savedToken,data.user,data.trades,savedSource,data.reflections,data.daily_ai_reviews);
+        await hydrateSession(savedToken,data.user,data.trades,savedSource,data.reflections,data.daily_ai_reviews,data.account_transactions,data.starting_balance);
       }catch(error){
         storage.remove(AUTH_TOKEN_KEY);
         storage.remove(AUTH_SOURCE_KEY);
@@ -5324,6 +5809,9 @@ function App(){
           setTrades([]);
           setReflections([]);
           setDailyAiReviews([]);
+          setAccountTransactions([]);
+          setStartingBalance(0);
+          setAccountModalOpen(false);
           clearActivePanels();
           if(!isServerUnavailableError(error)&&savedSource==="local")setAuthError(error.message||"Please log in again.");
         }
@@ -5345,6 +5833,8 @@ function App(){
   const openTradeDetail=trade=>{startTransition(()=>{setSelected(trade);setEditing(null);setShowForm(false);});};
   const closeDetailView=()=>{startTransition(()=>setSelected(null));};
   const closeTradeForm=()=>{startTransition(()=>{setShowForm(false);setEditing(null);});};
+  const openAccountModal=()=>startTransition(()=>setAccountModalOpen(true));
+  const closeAccountModal=()=>startTransition(()=>setAccountModalOpen(false));
   const syncTrades=async(nextTrades,successMessage,successColor=C.green)=>{
     if(!authToken){
       notify("Your session has ended. Please log in again.",C.red);
@@ -5360,6 +5850,59 @@ function App(){
       return true;
     }catch(error){
       notify(error.message||"Unable to save trades.",C.red);
+      return false;
+    }
+  };
+
+  const syncAccountLedger=async(nextStartingBalance,nextTransactions,successMessage,successColor=C.green)=>{
+    if(!authToken){
+      notify("Your session has ended. Please log in again.",C.red);
+      return false;
+    }
+
+    const payload={
+      startingBalance:normalizeStartingBalance(nextStartingBalance),
+      transactions:normalizeAccountTransactions(nextTransactions,user?.id),
+    };
+
+    try{
+      const data=authSource==="local"
+        ?await localSaveAccountLedger(authToken,payload)
+        :await apiRequest("/api/account-transactions",{
+          method:"PUT",
+          token:authToken,
+          body:{
+            starting_balance:payload.startingBalance,
+            account_transactions:payload.transactions,
+          },
+        });
+      setStartingBalance(normalizeStartingBalance(data.starting_balance));
+      setAccountTransactions(normalizeAccountTransactions(data.account_transactions,user?.id));
+      if(user?.id)saveStoredAccountLedger(user.id,{
+        startingBalance:data.starting_balance,
+        transactions:data.account_transactions,
+      });
+      if(successMessage)notify(successMessage,successColor);
+      return true;
+    }catch(error){
+      if(authSource!=="local"&&user?.id&&(isMissingAccountTransactionsRouteError(error)||isServerUnavailableError(error))){
+        try{
+          saveStoredAccountLedger(user.id,payload);
+          setStartingBalance(payload.startingBalance);
+          setAccountTransactions(payload.transactions);
+          if(successMessage)notify(`${successMessage} Saved in this browser.`,C.amber);
+          return true;
+        }catch(storageError){
+          notify(storageError.message||"Unable to save account transactions.",C.red);
+          return false;
+        }
+      }
+      notify(
+        isMissingAccountTransactionsRouteError(error)
+          ?"Account transactions API not available. Restart `npm run dev`, `npm run api`, or `npm run preview` so the backend loads `/api/account-transactions`."
+          :(error.message||"Unable to save account transactions."),
+        C.red,
+      );
       return false;
     }
   };
@@ -5423,7 +5966,7 @@ function App(){
     }
   };
 
-  const hydrateSession=async(nextToken,nextUser,nextTrades,nextSource="server",nextReflections=[],nextDailyAiReviews=[])=>{
+  const hydrateSession=async(nextToken,nextUser,nextTrades,nextSource="server",nextReflections=[],nextDailyAiReviews=[],nextAccountTransactions=[],nextStartingBalance=0)=>{
     storage.set(AUTH_TOKEN_KEY,nextToken);
     storage.set(AUTH_SOURCE_KEY,nextSource);
     setAuthToken(nextToken);
@@ -5431,6 +5974,14 @@ function App(){
     setUser(nextUser);
     setReflections(normalizeReflections(nextReflections,nextUser?.id));
     setDailyAiReviews(normalizeDailyAiReviews(nextDailyAiReviews,nextUser?.id));
+    const serverLedger={
+      startingBalance:normalizeStartingBalance(nextStartingBalance),
+      transactions:normalizeAccountTransactions(nextAccountTransactions,nextUser?.id),
+    };
+    const storedLedger=loadStoredAccountLedger(nextUser?.id);
+    const hasServerLedger=serverLedger.transactions.length>0||serverLedger.startingBalance!==0;
+    setAccountTransactions(hasServerLedger?serverLedger.transactions:storedLedger.transactions);
+    setStartingBalance(hasServerLedger?serverLedger.startingBalance:storedLedger.startingBalance);
 
     const serverTrades=normalizeTrades(nextTrades);
     const legacyTrades=loadLegacyTradesFromStorage();
@@ -5480,7 +6031,7 @@ function App(){
         source="local";
       }
 
-      await hydrateSession(data.token,data.user,data.trades,source,data.reflections,data.daily_ai_reviews);
+      await hydrateSession(data.token,data.user,data.trades,source,data.reflections,data.daily_ai_reviews,data.account_transactions,data.starting_balance);
       clearActivePanels();
       notify(source==="local"
         ?isServerUnavailableError(loginError)
@@ -5510,7 +6061,7 @@ function App(){
         source="local";
       }
 
-      await hydrateSession(data.token,data.user,data.trades,source,data.reflections,data.daily_ai_reviews);
+      await hydrateSession(data.token,data.user,data.trades,source,data.reflections,data.daily_ai_reviews,data.account_transactions,data.starting_balance);
       clearActivePanels();
       notify(source==="local"
         ?`Account created for ${data.user.username}. Using local account mode.`
@@ -5530,6 +6081,9 @@ function App(){
     setUser(null);
     setReflections([]);
     setDailyAiReviews([]);
+    setAccountTransactions([]);
+    setStartingBalance(0);
+    setAccountModalOpen(false);
     setAuthMode("login");
     setAuthError("");
     clearActivePanels();
@@ -5632,7 +6186,21 @@ function App(){
             <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",justifyContent:"flex-end",marginLeft:"auto"}}>
               <ThemeToggleButton theme={theme} onToggle={()=>setTheme(current=>current==="dark"?"light":"dark")}/>
               <Pill label={authSource==="local"?"Local mode":"Cloud sync"} color={authSource==="local"?C.amber:C.teal} sm/>
-              <div style={{padding:"10px 14px",borderRadius:18,background:C.surfaceAlt,boxShadow:C.shadow,display:"flex",alignItems:"center",gap:10}}>
+              <button
+                type="button"
+                onClick={openAccountModal}
+                style={{
+                  ...btnBase(),
+                  padding:"10px 14px",
+                  borderRadius:18,
+                  background:C.surfaceAlt,
+                  boxShadow:C.shadow,
+                  display:"flex",
+                  alignItems:"center",
+                  gap:10,
+                  textAlign:"left",
+                }}
+              >
                 <div style={{width:36,height:36,borderRadius:14,display:"flex",alignItems:"center",justifyContent:"center",background:C.accentBg}}>
                   <Icon name="user" size={16} color={C.accent}/>
                 </div>
@@ -5640,7 +6208,7 @@ function App(){
                   <div style={{fontSize:13,fontWeight:800,color:C.text}}>{user.username}</div>
                   <div style={{fontSize:11,color:C.muted}}>{trades.length} trades saved</div>
                 </div>
-              </div>
+              </button>
             </div>
           </div>
 
@@ -5675,8 +6243,19 @@ function App(){
         </ViewErrorBoundary>
       </div>
     </div>
+    <AccountTransactionsModal
+      open={accountModalOpen}
+      user={user}
+      tradesCount={trades.length}
+      startingBalance={startingBalance}
+      transactions={accountTransactions}
+      trades={trades}
+      onClose={closeAccountModal}
+      onSaveLedger={syncAccountLedger}
+    />
   </div>;
 }
 
 export default App;
+
 

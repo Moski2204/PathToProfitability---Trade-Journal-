@@ -97,6 +97,62 @@ function normalizeDailyAiReviewInput(input) {
   };
 }
 
+function roundCurrencyValue(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.round(numeric * 100) / 100;
+}
+
+function normalizeStartingBalanceInput(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    throw new Error("Starting balance must be a valid number.");
+  }
+  return roundCurrencyValue(numeric);
+}
+
+function normalizeAccountTransactionType(value, amount = 0) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "deposit" || normalized === "withdrawal") return normalized;
+  return Number(amount) < 0 ? "withdrawal" : "deposit";
+}
+
+function sortAccountTransactionsDescending(transactions) {
+  return [...transactions].sort((a, b) => {
+    const byDate = String(b.date || "").localeCompare(String(a.date || ""));
+    if (byDate !== 0) return byDate;
+    const byUpdatedAt = String(b.updated_at || "").localeCompare(String(a.updated_at || ""));
+    if (byUpdatedAt !== 0) return byUpdatedAt;
+    return String(a.account || "").localeCompare(String(b.account || ""));
+  });
+}
+
+function normalizeAccountTransactionInput(input) {
+  const account = String(input?.account || "").trim();
+  const type = normalizeAccountTransactionType(input?.type, input?.amount);
+  const date = String(input?.date || "").trim();
+  const amount = Number(input?.amount);
+
+  if (!account) {
+    throw new Error("Transaction account is required.");
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new Error("Transaction date must be in YYYY-MM-DD format.");
+  }
+  if (!Number.isFinite(amount)) {
+    throw new Error("Transaction amount must be a valid number.");
+  }
+
+  return {
+    id: String(input?.id || crypto.randomUUID()),
+    account,
+    type,
+    date,
+    amount: Math.abs(roundCurrencyValue(amount)),
+  };
+}
+
 function sortReflectionsDescending(reflections) {
   return [...reflections].sort((a, b) => {
     const byDate = String(b.date || "").localeCompare(String(a.date || ""));
@@ -119,6 +175,10 @@ function sortDailyAiReviewsDescending(reviews) {
 
 function getUserDailyAiReviews(user) {
   return Array.isArray(user.daily_ai_reviews) ? user.daily_ai_reviews : [];
+}
+
+function getUserAccountTransactions(user) {
+  return Array.isArray(user.account_transactions) ? sortAccountTransactionsDescending(user.account_transactions) : [];
 }
 
 function upsertUserReflection(user, input) {
@@ -260,6 +320,8 @@ app.post("/api/auth/register", async (req, res) => {
     trades: [],
     reflections: [],
     daily_ai_reviews: [],
+    account_transactions: [],
+    starting_balance: 0,
     createdAt: new Date().toISOString(),
   };
 
@@ -272,6 +334,8 @@ app.post("/api/auth/register", async (req, res) => {
     trades: user.trades,
     reflections: getUserReflections(user),
     daily_ai_reviews: getUserDailyAiReviews(user),
+    account_transactions: getUserAccountTransactions(user),
+    starting_balance: user.starting_balance || 0,
   });
 });
 
@@ -302,6 +366,8 @@ app.post("/api/auth/login", async (req, res) => {
     trades: Array.isArray(user.trades) ? user.trades : [],
     reflections: getUserReflections(user),
     daily_ai_reviews: getUserDailyAiReviews(user),
+    account_transactions: getUserAccountTransactions(user),
+    starting_balance: user.starting_balance || 0,
   });
 });
 
@@ -311,6 +377,8 @@ app.get("/api/auth/session", authenticate, async (req, res) => {
     trades: Array.isArray(req.user.trades) ? req.user.trades : [],
     reflections: getUserReflections(req.user),
     daily_ai_reviews: getUserDailyAiReviews(req.user),
+    account_transactions: getUserAccountTransactions(req.user),
+    starting_balance: req.user.starting_balance || 0,
   });
 });
 
@@ -333,6 +401,58 @@ app.put("/api/trades", authenticate, async (req, res) => {
   await writeDatabase(database);
 
   return res.json({ trades: user.trades });
+});
+
+app.put("/api/account-transactions", authenticate, async (req, res) => {
+  const startingBalance = req.body?.starting_balance;
+  const accountTransactions = req.body?.account_transactions;
+
+  if (!Array.isArray(accountTransactions)) {
+    return res.status(400).json({ error: "Account transactions payload must be an array." });
+  }
+
+  const database = await readDatabase();
+  const user = database.users.find((entry) => entry.id === req.user.id);
+
+  if (!user) {
+    return res.status(401).json({ error: "Session is no longer valid." });
+  }
+
+  try {
+    const now = new Date().toISOString();
+    const currentTransactions = getUserAccountTransactions(user);
+    const normalizedTransactions = accountTransactions.map((entry) => {
+      const nextEntry = normalizeAccountTransactionInput(entry);
+      const existing = currentTransactions.find((transaction) => transaction.id === nextEntry.id);
+      const changed = !existing
+        || existing.account !== nextEntry.account
+        || normalizeAccountTransactionType(existing.type, existing.amount) !== nextEntry.type
+        || existing.date !== nextEntry.date
+        || roundCurrencyValue(existing.amount) !== nextEntry.amount;
+
+      return {
+        ...nextEntry,
+        user_id: user.id,
+        created_at: existing?.created_at || String(entry?.created_at || entry?.createdAt || now),
+        updated_at: changed
+          ? now
+          : String(existing?.updated_at || entry?.updated_at || entry?.updatedAt || now),
+      };
+    });
+
+    user.starting_balance = normalizeStartingBalanceInput(startingBalance);
+    user.account_transactions = sortAccountTransactionsDescending(normalizedTransactions);
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : "Invalid account transactions." });
+  }
+
+  user.updatedAt = new Date().toISOString();
+  await writeDatabase(database);
+
+  return res.json({
+    starting_balance: user.starting_balance,
+    account_transactions: getUserAccountTransactions(user),
+  });
 });
 
 app.put("/api/reflections", authenticate, async (req, res) => {
