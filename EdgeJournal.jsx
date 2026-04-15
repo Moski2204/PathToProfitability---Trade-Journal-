@@ -1163,6 +1163,82 @@ function fmtPct(n){
   return`${(n*100).toFixed(1)}%`;
 }
 
+function fmtSignedPct(n){
+  return`${n>0?"+":""}${fmtPct(n)}`;
+}
+
+function timeToMinutes(value){
+  const parts=parseTimeParts(value);
+  return parts?(parts.hours*60)+parts.minutes:null;
+}
+
+function buildExitRoiBreakdown(trade){
+  const entries=(Array.isArray(trade?.entries)?trade.entries:[])
+    .map((entry,index)=>({
+      index,
+      price:parseMaybeNumber(entry?.price),
+      qty:parseMaybeNumber(entry?.qty)??0,
+      minutes:timeToMinutes(entry?.time),
+    }))
+    .filter(entry=>entry.price!==null&&entry.qty>0)
+    .sort((a,b)=>
+      (a.minutes??-Infinity)-(b.minutes??-Infinity)||
+      a.index-b.index
+    );
+
+  const exits=(Array.isArray(trade?.exits)?trade.exits:[])
+    .map((exit,index)=>({
+      index,
+      price:parseMaybeNumber(exit?.price),
+      qty:parseMaybeNumber(exit?.qty)??0,
+      minutes:timeToMinutes(exit?.time),
+    }))
+    .sort((a,b)=>
+      (a.minutes??Infinity)-(b.minutes??Infinity)||
+      a.index-b.index
+    );
+
+  const breakdown=Array.from({length:Array.isArray(trade?.exits)?trade.exits.length:0},()=>({
+    avgCost:null,
+    costBasis:null,
+    pnl:null,
+    roi:null,
+  }));
+  let entryCursor=0;
+  let activeQty=0;
+  let activeCost=0;
+
+  exits.forEach(exit=>{
+    const exitSortMinutes=exit.minutes??Infinity;
+    while(entryCursor<entries.length&&(entries[entryCursor].minutes??-Infinity)<=exitSortMinutes){
+      activeQty+=entries[entryCursor].qty;
+      activeCost+=entries[entryCursor].price*entries[entryCursor].qty;
+      entryCursor+=1;
+    }
+
+    if(exit.price===null||exit.qty<=0||activeQty<=0||activeCost<=0)return;
+
+    const avgCost=activeCost/activeQty;
+    const costBasis=avgCost*exit.qty;
+    const pnl=(exit.price-avgCost)*exit.qty;
+    breakdown[exit.index]={
+      avgCost,
+      costBasis,
+      pnl,
+      roi:costBasis>0?pnl/costBasis:null,
+    };
+
+    activeQty-=exit.qty;
+    activeCost-=avgCost*exit.qty;
+    if(activeQty<=0.000001||activeCost<=0.000001){
+      activeQty=0;
+      activeCost=0;
+    }
+  });
+
+  return breakdown;
+}
+
 const NOTE_SIGNALS=[
   {key:"early_exit",label:"selling winners early",tone:"negative",patterns:[/\bsold early\b/i,/\bexit(?:ed)? early\b/i,/left money/i,/could(?:'ve| have) held/i,/should(?:'ve| have) sold/i,/more profit/i]},
   {key:"early_entry",label:"entering too early",tone:"negative",patterns:[/entered too early/i,/entry was too early/i,/way too early/i,/didn'?t wait/i,/did not wait/i,/should(?:'ve| have) waited/i]},
@@ -4434,6 +4510,7 @@ function TradeLogView({trades,onSelect,onNew,onEdit,onImportCSV,onExportCSV,onRe
 function TradeDetail({trade,onBack,onEdit,onDelete}){
   const pnl=calcPnl(trade),rr=calcRR(trade),dur=calcDur(trade);
   const timeRange=formatTimeRange(trade.entries[0]?.time,trade.exits[0]?.time);
+  const exitRoiBreakdown=buildExitRoiBreakdown(trade);
   const [delConfirm,setDelConfirm]=useState(false);
   return<div style={{display:"flex",flexDirection:"column",gap:20,animation:"riseIn .45s ease both"}}>
     <PageIntro
@@ -4498,13 +4575,31 @@ function TradeDetail({trade,onBack,onEdit,onDelete}){
       <Card>
         <SLabel>Exits</SLabel>
         <div style={{display:"grid",gap:10}}>
-          {trade.exits.map((e,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 0",borderBottom:"1px solid rgba(148,163,184,0.18)"}}>
-            <div>
-              <div style={{fontSize:14,fontWeight:700,color:C.text}}>Exit {i+1}</div>
-              <div style={{fontSize:12,color:C.muted}}>{e.time?formatTime12h(e.time):"Time not set"}</div>
-            </div>
-            <div style={{fontSize:15,fontWeight:700,color:C.text,fontFamily:"'Sora','Manrope',sans-serif"}}>${(+e.price).toFixed(2)} x {e.qty}</div>
-          </div>)}
+          {trade.exits.map((e,i)=>{
+            const breakdown=exitRoiBreakdown[i];
+            const roi=breakdown?.roi??null;
+            const avgCost=breakdown?.avgCost;
+            const price=parseMaybeNumber(e.price);
+            const qty=parseMaybeNumber(e.qty)??0;
+            const roiColor=roi===null?C.dim:roi>=0?C.green:C.red;
+            return <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:16,padding:"14px 0",borderBottom:"1px solid rgba(148,163,184,0.18)"}}>
+              <div>
+                <div style={{fontSize:14,fontWeight:700,color:C.text}}>Exit {i+1}</div>
+                <div style={{fontSize:12,color:C.muted}}>{e.time?formatTime12h(e.time):"Time not set"}</div>
+                <div style={{fontSize:12,color:C.muted,marginTop:4}}>
+                  {Number.isFinite(avgCost)?`Avg cost $${avgCost.toFixed(2)}`:"Avg cost N/A"}
+                </div>
+              </div>
+              <div style={{textAlign:"right",display:"grid",gap:5,justifyItems:"end"}}>
+                <div style={{fontSize:15,fontWeight:700,color:C.text,fontFamily:"'Sora','Manrope',sans-serif"}}>
+                  {price===null?"Price N/A":`$${price.toFixed(2)}`} x {qty}
+                </div>
+                <div style={{fontSize:13,fontWeight:800,color:roiColor,fontFamily:"'Sora','Manrope',sans-serif"}}>
+                  {roi===null?"ROI N/A":`${fmtSignedPct(roi)} ROI`}
+                </div>
+              </div>
+            </div>;
+          })}
         </div>
       </Card>
     </div>
