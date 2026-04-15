@@ -1119,12 +1119,54 @@ function calcRR(t){
   const risk=Math.abs(ae-t.stopLoss),reward=Math.abs(+t.targetPrice-ae);
   return risk>0?(reward/risk).toFixed(2):null;
 }
+
+function elapsedMinutes(startMinutes,endMinutes){
+  if(startMinutes===null||endMinutes===null)return null;
+  const elapsed=endMinutes-startMinutes;
+  return elapsed>=0?elapsed:elapsed+(24*60);
+}
+
+function getTimedTradeRows(rows){
+  return(Array.isArray(rows)?rows:[])
+    .map((row,index)=>({index,time:row?.time||"",minutes:timeToMinutes(row?.time)}))
+    .filter(row=>row.minutes!==null)
+    .sort((a,b)=>a.minutes-b.minutes||a.index-b.index);
+}
+
 function calcDur(t){
   if(parseMaybeNumber(t.holdMinutes)!==null)return parseMaybeNumber(t.holdMinutes);
-  if(!t.entries[0]?.time||!t.exits[0]?.time)return null;
-  const [eh,em]=t.entries[0].time.split(":").map(Number);
-  const [xh,xm]=t.exits[0].time.split(":").map(Number);
-  return(xh*60+xm)-(eh*60+em);
+  const entries=getTimedTradeRows(t.entries);
+  const exits=getTimedTradeRows(t.exits);
+  if(!entries.length||!exits.length)return null;
+  return elapsedMinutes(entries[0].minutes,exits[exits.length-1].minutes);
+}
+
+function getTradeTimeRangeLabel(trade){
+  const entries=getTimedTradeRows(trade?.entries);
+  const exits=getTimedTradeRows(trade?.exits);
+  return formatTimeRange(entries[0]?.time,exits[exits.length-1]?.time);
+}
+
+function fmtDuration(minutes){
+  const total=Math.round(Number(minutes));
+  if(!Number.isFinite(total)||total<0)return"Hold N/A";
+  if(total<60)return`${total} min`;
+  const hours=Math.floor(total/60);
+  const mins=total%60;
+  return mins?`${hours}h ${mins}m`:`${hours}h`;
+}
+
+function calcContractQty(trade){
+  const entryQty=(Array.isArray(trade?.entries)?trade.entries:[]).reduce((sum,row)=>sum+(parseMaybeNumber(row?.qty)??0),0);
+  if(entryQty>0)return entryQty;
+  return(Array.isArray(trade?.exits)?trade.exits:[]).reduce((sum,row)=>sum+(parseMaybeNumber(row?.qty)??0),0);
+}
+
+function formatContractQty(qty){
+  const value=Number(qty);
+  if(!Number.isFinite(value)||value<=0)return"Contracts N/A";
+  const label=Number.isInteger(value)?String(value):value.toFixed(2).replace(/\.?0+$/,"");
+  return`${label} contract${value===1?"":"s"}`;
 }
 function calcStats(trades){
   if(!trades.length)return{totalPnl:0,winRate:0,avgWin:0,avgLoss:0,profitFactor:0,expectancy:0,maxDD:0,curve:[0],wins:0,losses:0,washes:0,decisiveTrades:0,loggedTrades:0};
@@ -1234,6 +1276,63 @@ function buildExitRoiBreakdown(trade){
       activeQty=0;
       activeCost=0;
     }
+  });
+
+  return breakdown;
+}
+
+function buildExitHoldBreakdown(trade){
+  const entries=(Array.isArray(trade?.entries)?trade.entries:[])
+    .map((entry,index)=>({
+      index,
+      qty:parseMaybeNumber(entry?.qty)??0,
+      minutes:timeToMinutes(entry?.time),
+    }))
+    .filter(entry=>entry.qty>0&&entry.minutes!==null)
+    .sort((a,b)=>a.minutes-b.minutes||a.index-b.index);
+
+  const exits=(Array.isArray(trade?.exits)?trade.exits:[])
+    .map((exit,index)=>({
+      index,
+      qty:parseMaybeNumber(exit?.qty)??0,
+      minutes:timeToMinutes(exit?.time),
+    }))
+    .sort((a,b)=>
+      (a.minutes??Infinity)-(b.minutes??Infinity)||
+      a.index-b.index
+    );
+
+  const breakdown=Array.from({length:Array.isArray(trade?.exits)?trade.exits.length:0},()=>null);
+  const activeLots=[];
+  let entryCursor=0;
+
+  exits.forEach(exit=>{
+    if(exit.qty<=0||exit.minutes===null)return;
+
+    while(entryCursor<entries.length&&entries[entryCursor].minutes<=exit.minutes){
+      activeLots.push({...entries[entryCursor],remainingQty:entries[entryCursor].qty});
+      entryCursor+=1;
+    }
+
+    let remainingExitQty=exit.qty;
+    let matchedQty=0;
+    let weightedHold=0;
+
+    while(remainingExitQty>0&&activeLots.length){
+      const lot=activeLots[0];
+      const consumedQty=Math.min(remainingExitQty,lot.remainingQty);
+      const hold=elapsedMinutes(lot.minutes,exit.minutes);
+      if(hold!==null){
+        weightedHold+=hold*consumedQty;
+        matchedQty+=consumedQty;
+      }
+
+      lot.remainingQty-=consumedQty;
+      remainingExitQty-=consumedQty;
+      if(lot.remainingQty<=0.000001)activeLots.shift();
+    }
+
+    breakdown[exit.index]=matchedQty>0?weightedHold/matchedQty:null;
   });
 
   return breakdown;
@@ -2476,7 +2575,8 @@ function TradeCard({trade,pnl,onSelect,onEdit}){
   const dur=calcDur(trade);
   const entryNotional=calcEntryNotional(trade);
   const returnPct=entryNotional?pnl/entryNotional:null;
-  const timeRange=formatTimeRange(trade.entries[0]?.time,trade.exits[0]?.time);
+  const timeRange=getTradeTimeRangeLabel(trade);
+  const contractLabel=formatContractQty(calcContractQty(trade));
   const pre=cleanTradeNoteText(trade.preTrade);
   const post=cleanTradeNoteText(trade.postTrade);
   const hasNotes=Boolean(pre||post);
@@ -2521,7 +2621,7 @@ function TradeCard({trade,pnl,onSelect,onEdit}){
               <Pill label={trade.strategy} color={C.purple}/>
             </div>
             <div style={{fontSize:13,color:C.muted,lineHeight:1.7}}>
-              {trade.date}{timeRange?` | ${timeRange}`:""} | {trade.market} | {trade.emotion}
+              {trade.date}{timeRange?` | ${timeRange}`:""} | {contractLabel} | {trade.market} | {trade.emotion}
             </div>
           </div>
         </div>
@@ -2530,15 +2630,15 @@ function TradeCard({trade,pnl,onSelect,onEdit}){
             <div style={{fontSize:28,fontWeight:800,color:pnl>=0?C.green:C.red,fontFamily:"'Sora','Manrope',sans-serif"}}>{pnl>=0?"+$":"-$"}{Math.abs(pnl).toFixed(0)}</div>
             {returnPct!==null&&<div style={{fontSize:16,fontWeight:800,color:returnPct>=0?C.green:C.red,fontFamily:"'Sora','Manrope',sans-serif"}}>{fmtPct(returnPct)}</div>}
           </div>
-          <div style={{fontSize:12,color:C.muted}}>{dur!==null?`${dur} min hold`:"Duration unavailable"}</div>
+          <div style={{fontSize:12,color:C.muted}}>{dur!==null?`${fmtDuration(dur)} hold`:"Duration unavailable"}</div>
         </div>
       </div>
 
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:14}}>
         <div style={{padding:"14px 15px",borderRadius:16,background:C.surfaceSoft}}>
           <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:700,marginBottom:5}}>Entry / Exit</div>
-          <div style={{fontSize:15,fontWeight:700,color:C.text}}>${trade.entries[0]?.price}</div>
-          <div style={{fontSize:12,color:C.muted}}>to ${trade.exits[0]?.price}</div>
+          <div style={{fontSize:15,fontWeight:700,color:C.text}}>{contractLabel}</div>
+          <div style={{fontSize:12,color:C.textSoft,marginTop:4}}>${trade.entries[0]?.price} to ${trade.exits[0]?.price}</div>
         </div>
         <div style={{padding:"14px 15px",borderRadius:16,background:C.surfaceSoft}}>
           <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:700,marginBottom:5}}>Execution Tags</div>
@@ -2917,7 +3017,7 @@ function LegacyDashboardView({trades}){
             </div>
             <div style={{padding:"14px 16px",borderRadius:16,background:C.glass,boxShadow:C.shadow}}>
               <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:700,marginBottom:4}}>Profit Factor</div>
-              <div style={{fontSize:24,fontWeight:800,color:pf>=1.5?C.green:pf>=1?C.amber:C.red,fontFamily:"'Sora','Manrope',sans-serif"}}>{pf>=999?"âˆž":pf.toFixed(2)}</div>
+              <div style={{fontSize:24,fontWeight:800,color:pf>=1.5?C.green:pf>=1?C.amber:C.red,fontFamily:"'Sora','Manrope',sans-serif"}}>{pf>=999?"Inf":pf.toFixed(2)}</div>
               <div style={{fontSize:12,color:C.muted}}>{trades.length} trades logged</div>
             </div>
           </div>
@@ -2925,7 +3025,7 @@ function LegacyDashboardView({trades}){
       </Card>
       <div style={{display:"grid",gap:14}}>
         <Metric label="Win Rate" value={`${(stats.winRate*100).toFixed(1)}%`} icon="target" trend={{tone:stats.winRate>=0.5?"positive":"warning",label:stats.winRate>=0.5?"Above 50%":"Needs work"}} sub={`${stats.wins} winning trades`} small/>
-        <Metric label="Profit Factor" value={pf>=999?"âˆž":pf.toFixed(2)} color={pf>=1.5?C.green:pf>=1?C.amber:C.red} icon="pulse" trend={{tone:pf>=1.5?"positive":pf>=1?"warning":"negative",label:pf>=1.5?"Healthy edge":pf>=1?"Break-even zone":"Below target"}} small/>
+        <Metric label="Profit Factor" value={pf>=999?"Inf":pf.toFixed(2)} color={pf>=1.5?C.green:pf>=1?C.amber:C.red} icon="pulse" trend={{tone:pf>=1.5?"positive":pf>=1?"warning":"negative",label:pf>=1.5?"Healthy edge":pf>=1?"Break-even zone":"Below target"}} small/>
         <Metric label="Expectancy" value={`${stats.expectancy>=0?"+$":"-$"}${Math.abs(stats.expectancy).toFixed(0)}`} color={stats.expectancy>=0?C.green:C.red} icon="spark" trend={{tone:stats.expectancy>=0?"positive":"negative",label:stats.expectancy>=0?"Positive expectancy":"Negative expectancy"}} small/>
       </div>
     </div>
@@ -3004,7 +3104,7 @@ function DashboardClassicView({trades}){
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(210px,1fr))",gap:16}}>
       <Metric label="Total P&L" value={fmtMoney(stats.totalPnl)} color={stats.totalPnl>=0?C.green:C.red} icon="wallet" small emphasis sub="Net journal performance"/>
       <Metric label="Win Rate" value={`${(stats.winRate*100).toFixed(1)}%`} icon="target" trend={{tone:stats.winRate>=0.5?"positive":"warning",label:stats.winRate>=0.5?"Above 50%":"Needs work"}} sub={`${stats.wins} winning trades`} small/>
-      <Metric label="Profit Factor" value={pf>=999?"âˆž":pf.toFixed(2)} color={pf>=1.5?C.green:pf>=1?C.amber:C.red} icon="pulse" trend={{tone:pf>=1.5?"positive":pf>=1?"warning":"negative",label:pf>=1.5?"Healthy edge":pf>=1?"Break-even zone":"Below target"}} small/>
+      <Metric label="Profit Factor" value={pf>=999?"Inf":pf.toFixed(2)} color={pf>=1.5?C.green:pf>=1?C.amber:C.red} icon="pulse" trend={{tone:pf>=1.5?"positive":pf>=1?"warning":"negative",label:pf>=1.5?"Healthy edge":pf>=1?"Break-even zone":"Below target"}} small/>
       <Metric label="Avg Win" value={`+$${stats.avgWin.toFixed(0)}`} color={C.green} icon="arrowUp" small sub="Average winning trade"/>
       <Metric label="Avg Loss" value={`-$${stats.avgLoss.toFixed(0)}`} color={C.red} icon="arrowDown" small sub="Average losing trade"/>
       <Metric label="Max Drawdown" value={`-$${stats.maxDD.toFixed(0)}`} color={C.red} icon="chart" small sub="Largest pullback"/>
@@ -4223,7 +4323,7 @@ function AnalyticsCalendar({trades}){
             </div>
             <div style={{fontSize:12,color:C.muted}}>{week.tradesTaken} trade{week.tradesTaken!==1?"s":""} in this week</div>
             <div style={{fontSize:12,color:C.muted}}>
-              <span style={{color:C.green,fontWeight:800}}>{week.wins}</span> wins Â· <span style={{color:C.red,fontWeight:800}}>{week.losses}</span> losses
+              <span style={{color:C.green,fontWeight:800}}>{week.wins}</span> wins / <span style={{color:C.red,fontWeight:800}}>{week.losses}</span> losses
             </div>
           </div>
         </div>)}
@@ -4257,18 +4357,18 @@ function AnalyticsCalendar({trades}){
           <div style={{padding:"14px 16px",borderRadius:18,background:C.surface,boxShadow:C.shadow}}>
             <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800,marginBottom:6}}>Trades Logged</div>
             <div style={{fontSize:28,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif"}}>{selectedDayTrades.length}</div>
-            <div style={{fontSize:12,color:C.muted,marginTop:5}}>{selectedDayWins} wins Â· {selectedDayLosses} losses{selectedDayWashes?` Â· ${selectedDayWashes} wash`:``}</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:5}}>{selectedDayWins} wins / {selectedDayLosses} losses{selectedDayWashes?` / ${selectedDayWashes} wash`:``}</div>
           </div>
           <div style={{padding:"14px 16px",borderRadius:18,background:C.surface,boxShadow:C.shadow}}>
             <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800,marginBottom:6}}>Average Hold</div>
-            <div style={{fontSize:28,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif"}}>{selectedDayAvgHold===null?"N/A":`${Math.round(selectedDayAvgHold)}m`}</div>
-            <div style={{fontSize:12,color:C.muted,marginTop:5}}>Measured from first entry to first exit.</div>
+            <div style={{fontSize:28,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif"}}>{selectedDayAvgHold===null?"N/A":fmtDuration(selectedDayAvgHold)}</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:5}}>Measured from first entry to final exit.</div>
           </div>
           <div style={{padding:"14px 16px",borderRadius:18,background:C.surface,boxShadow:C.shadow}}>
             <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800,marginBottom:6}}>Amount Risked Today</div>
             <div style={{fontSize:28,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif"}}>{displayMoney(selectedDayAvgEntrySpend)}</div>
             <div style={{fontSize:12,color:C.muted,marginTop:5}}>
-              Amount risked {displayMoney(selectedDayAvgEntrySpend)} per trade · Avg exit {displayMoney(selectedDayAvgExitValue)} per trade.
+              Amount risked {displayMoney(selectedDayAvgEntrySpend)} per trade / Avg exit {displayMoney(selectedDayAvgExitValue)} per trade.
             </div>
           </div>
         </div>
@@ -4282,7 +4382,7 @@ function AnalyticsCalendar({trades}){
             const hold=calcDur(trade);
             const entryAvg=averagePrice(trade.entries);
             const exitAvg=averagePrice(trade.exits);
-            const timeRange=formatTimeRange(trade.entries[0]?.time,trade.exits[0]?.time);
+            const timeRange=getTradeTimeRangeLabel(trade);
             const notes=clipText((trade.postTrade||trade.preTrade||"").trim(),180);
             return<div key={trade.id} style={{padding:"18px 18px 16px",borderRadius:20,background:C.surfaceAlt,boxShadow:C.shadow,display:"grid",gap:14}}>
               <div style={{display:"flex",justifyContent:"space-between",gap:16,alignItems:"flex-start",flexWrap:"wrap"}}>
@@ -4294,7 +4394,7 @@ function AnalyticsCalendar({trades}){
                     <Pill label={trade.market} color={C.teal}/>
                   </div>
                   <div style={{fontSize:13,color:C.muted,lineHeight:1.7}}>
-                    {timeRange||"Time not set"} Â· {qty} contract{qty!==1?"s":""} Â· {hold===null?"Hold N/A":`${hold} min hold`}
+                    {timeRange||"Time not set"} / {qty} contract{qty!==1?"s":""} / {hold===null?"Hold N/A":`${fmtDuration(hold)} hold`}
                   </div>
                 </div>
                 <div style={{textAlign:"right"}}>
@@ -4509,8 +4609,9 @@ function TradeLogView({trades,onSelect,onNew,onEdit,onImportCSV,onExportCSV,onRe
 // â”€â”€ TRADE DETAIL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function TradeDetail({trade,onBack,onEdit,onDelete}){
   const pnl=calcPnl(trade),rr=calcRR(trade),dur=calcDur(trade);
-  const timeRange=formatTimeRange(trade.entries[0]?.time,trade.exits[0]?.time);
+  const timeRange=getTradeTimeRangeLabel(trade);
   const exitRoiBreakdown=buildExitRoiBreakdown(trade);
+  const exitHoldBreakdown=buildExitHoldBreakdown(trade);
   const [delConfirm,setDelConfirm]=useState(false);
   return<div style={{display:"flex",flexDirection:"column",gap:20,animation:"riseIn .45s ease both"}}>
     <PageIntro
@@ -4551,7 +4652,7 @@ function TradeDetail({trade,onBack,onEdit,onDelete}){
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(210px,1fr))",gap:16}}>
       <Metric label="Net P&L" value={`${pnl>=0?"+$":"-$"}${Math.abs(pnl).toFixed(2)}`} color={pnl>=0?C.green:C.red} icon="wallet" small/>
       <Metric label="Planned RR" value={rr?`${rr}x`:"Not set"} icon="target" small/>
-      <Metric label="Duration" value={dur!==null?`${dur}m`:"N/A"} icon="calendar" small/>
+      <Metric label="Duration" value={dur!==null?fmtDuration(dur):"N/A"} icon="calendar" small/>
       <Metric label="Fees" value={`$${trade.fees}`} color={trade.fees?C.red:C.text} icon="pulse" small/>
     </div>
 
@@ -4577,6 +4678,7 @@ function TradeDetail({trade,onBack,onEdit,onDelete}){
         <div style={{display:"grid",gap:10}}>
           {trade.exits.map((e,i)=>{
             const breakdown=exitRoiBreakdown[i];
+            const hold=exitHoldBreakdown[i];
             const roi=breakdown?.roi??null;
             const avgCost=breakdown?.avgCost;
             const price=parseMaybeNumber(e.price);
@@ -4587,6 +4689,9 @@ function TradeDetail({trade,onBack,onEdit,onDelete}){
                 <div style={{fontSize:14,fontWeight:700,color:C.text}}>Exit {i+1}</div>
                 <div style={{fontSize:12,color:C.muted}}>{e.time?formatTime12h(e.time):"Time not set"}</div>
                 <div style={{fontSize:12,color:C.muted,marginTop:4}}>
+                  {Number.isFinite(hold)?`${fmtDuration(hold)} hold`:"Hold N/A"}
+                </div>
+                <div style={{fontSize:12,color:C.muted,marginTop:3}}>
                   {Number.isFinite(avgCost)?`Avg cost $${avgCost.toFixed(2)}`:"Avg cost N/A"}
                 </div>
               </div>
@@ -4877,20 +4982,20 @@ function LegacyAnalyticsView({trades}){
   return<div style={{display:"flex",flexDirection:"column",gap:12}}>
     <div style={{display:"grid",gridTemplateColumns:"repeat(4,minmax(0,1fr))",gap:9}}>
       <Metric label="Win Rate" value={(stats.winRate*100).toFixed(1)+"%"} small/>
-      <Metric label="Profit Factor" value={pf>=999?"âˆž":pf.toFixed(2)} color={pf>=1.5?C.green:pf>=1?C.amber:C.red} small/>
+      <Metric label="Profit Factor" value={pf>=999?"Inf":pf.toFixed(2)} color={pf>=1.5?C.green:pf>=1?C.amber:C.red} small/>
       <Metric label="Expectancy" value={(stats.expectancy>=0?"+$":"-$")+Math.abs(stats.expectancy).toFixed(0)} color={stats.expectancy>=0?C.green:C.red} small/>
       <Metric label="Max Drawdown" value={"-$"+stats.maxDD.toFixed(0)} color={C.red} small/>
     </div>
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
       <Card><SLabel>Long vs Short</SLabel>
         {["LONG","SHORT"].map(d=><div key={d} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:`1px solid ${C.border}`}}>
-          <div style={{display:"flex",gap:8,alignItems:"center"}}><Pill label={d} color={d==="SHORT"?C.amber:C.accent}/><span style={{fontSize:11,color:C.muted}}>{bDir[d].w}W / {bDir[d].n-bDir[d].w}L Â· {bDir[d].n?((bDir[d].w/bDir[d].n)*100).toFixed(0):0}%</span></div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}><Pill label={d} color={d==="SHORT"?C.amber:C.accent}/><span style={{fontSize:11,color:C.muted}}>{bDir[d].w}W / {bDir[d].n-bDir[d].w}L / {bDir[d].n?((bDir[d].w/bDir[d].n)*100).toFixed(0):0}%</span></div>
           <span style={{fontFamily:"monospace",fontWeight:700,color:bDir[d].pnl>=0?C.green:C.red}}>{bDir[d].pnl>=0?"+$":"-$"}{Math.abs(bDir[d].pnl).toFixed(0)}</span>
         </div>)}
       </Card>
       <Card><SLabel>By Strategy</SLabel>
         {Object.entries(bStrat).map(([s,v])=><div key={s} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${C.border}`}}>
-          <div style={{display:"flex",gap:8,alignItems:"center"}}><Pill label={s} color={C.purple} sm/><span style={{fontSize:10,color:C.muted}}>{v.w}/{v.n} Â· {v.n?((v.w/v.n)*100).toFixed(0):0}%</span></div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}><Pill label={s} color={C.purple} sm/><span style={{fontSize:10,color:C.muted}}>{v.w}/{v.n} / {v.n?((v.w/v.n)*100).toFixed(0):0}%</span></div>
           <span style={{fontFamily:"monospace",fontWeight:700,color:v.pnl>=0?C.green:C.red,fontSize:13}}>{v.pnl>=0?"+$":"-$"}{Math.abs(v.pnl).toFixed(0)}</span>
         </div>)}
       </Card>
@@ -5276,7 +5381,7 @@ function AnalyticsView({trades}){
     </Card>
 
     {false&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:14}}>
-      <Metric label="Win Rate" value={fmtPct(stats.winRate)} icon="target" small sub={`${stats.wins} wins Â· ${stats.losses} losses`}/>
+      <Metric label="Win Rate" value={fmtPct(stats.winRate)} icon="target" small sub={`${stats.wins} wins / ${stats.losses} losses`}/>
       <Metric label="Avg Win" value={fmtMoney(stats.avgWin)} color={C.green} icon="arrowUp" small sub="Average upside when right"/>
       <Metric label="Avg Loss" value={`-${fmtMoney(stats.avgLoss).replace(/^[-+]/,"")}`} color={C.red} icon="arrowDown" small sub="Average downside when wrong"/>
       <Metric label="Win/Loss Ratio" value={winLossRatio.toFixed(2)} color={winLossRatio>=1.5?C.green:winLossRatio>=1?C.amber:C.red} icon="layers" small sub="Size of winners vs losers"/>
@@ -5483,7 +5588,7 @@ function AnalyticsView({trades}){
               <span style={{fontSize:12,color:C.muted}}>{row.n} trades</span>
             </div>
             <div style={{fontSize:13,color:C.muted,lineHeight:1.7}}>
-              {row.w} wins Â· {row.n-row.w} losses Â· {fmtPct(row.rate)} win rate
+              {row.w} wins / {row.n-row.w} losses / {fmtPct(row.rate)} win rate
             </div>
           </div>
           <div style={{textAlign:"right"}}>
@@ -5550,7 +5655,7 @@ function ExtremeTradeRow({row,tone,index}){
     <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
       <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
         <Pill label={row.entryNotional>0?`Entry $${row.entryNotional.toFixed(0)}`:"Entry N/A"} color={C.teal} sm/>
-        {row.hold!==null&&<Pill label={`${row.hold} min hold`} color="transparent" sm/>}
+        {row.hold!==null&&<Pill label={`${fmtDuration(row.hold)} hold`} color="transparent" sm/>}
       </div>
     </div>
   </div>;
