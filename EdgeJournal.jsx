@@ -6064,8 +6064,12 @@ function importCSV(text){
 }
 function exportCSV(trades){
   const csvEscape=value=>{
-    const text=String(value??"");
-    return/[",\n]/.test(text)?`"${text.replace(/"/g,'""')}"`:text;
+    const text=String(value??"")
+      .replace(/\uFEFF/g,"")
+      .replace(/\r\n|\r|\n/g," ")
+      .replace(/\s+/g," ")
+      .trim();
+    return/[",]/.test(text)?`"${text.replace(/"/g,'""')}"`:text;
   };
   const money=value=>{
     const amount=parseMaybeNumber(value);
@@ -6096,41 +6100,55 @@ function exportCSV(trades){
     if(!totalQty)return null;
     return rows.reduce((sum,row)=>sum+((+row.price||0)*(+row.qty||0)),0)/totalQty;
   };
-  const columns=["Entry Date","Entry Time","Exit Date","Symbol","Market","Status","Side","Qty","Entry","Exit","Target","Ent Tot","Ext Tot","Pos","Hold","Return","Return %","Tags","Notes"];
-  const rows=trades.map(trade=>{
-    const qty=trade.entries.reduce((sum,row)=>sum+(+row.qty||0),0)||trade.exits.reduce((sum,row)=>sum+(+row.qty||0),0)||1;
-    const entryAvg=averagePrice(trade.entries);
-    const exitAvg=averagePrice(trade.exits);
-    const entryTotal=entryAvg!==null?entryAvg*qty:null;
-    const exitTotal=exitAvg!==null?exitAvg*qty:null;
-    const pnl=calcPnl(trade);
-    const hold=calcDur(trade);
-    const returnPct=entryTotal?((pnl/entryTotal)*100):null;
-    const notes=(trade.postTrade||trade.preTrade||"").trim();
-    const status=getTradeOutcome(trade);
 
-    return[
-      trade.entries[0]?.date||trade.date||"",
-      trade.entries[0]?.time||"",
-      trade.exits[0]?.date||trade.date||"",
-      trade.symbol||"",
-      exportMarket(trade.market),
-      status,
-      getDirectionLabel(trade.direction),
-      qty,
-      money(entryAvg),
-      money(exitAvg),
-      plainNumber(trade.targetPrice),
-      money(entryTotal),
-      money(exitTotal),
-      trade.direction==="SHORT"?"-":"+",
-      hold!==null?`${hold} MIN`:"",
-      money(pnl),
-      percent(returnPct),
-      trade.strategy||"",
-      notes,
-    ].map(csvEscape).join(",");
+  const normalizedTrades=[];
+  const seen=new Set();
+  (Array.isArray(trades)?trades:[]).forEach(trade=>{
+    const normalized=normalizeTrade(trade);
+    if(!normalized)return;
+    const key=tradeFingerprint(normalized);
+    if(seen.has(key))return;
+    seen.add(key);
+    normalizedTrades.push(normalized);
   });
+
+  const columns=["Entry Date","Entry Time","Exit Date","Symbol","Market","Status","Side","Qty","Entry","Exit","Target","Ent Tot","Ext Tot","Pos","Hold","Return","Return %","Tags","Notes"];
+  const rows=normalizedTrades
+    .sort((a,b)=>getTradeDateTime(b)-getTradeDateTime(a)||getTradeExitDateTime(b)-getTradeExitDateTime(a)||String(b.id||"").localeCompare(String(a.id||"")))
+    .map(trade=>{
+      const qty=trade.entries.reduce((sum,row)=>sum+(+row.qty||0),0)||trade.exits.reduce((sum,row)=>sum+(+row.qty||0),0)||1;
+      const entryAvg=averagePrice(trade.entries);
+      const exitAvg=averagePrice(trade.exits);
+      const entryTotal=entryAvg!==null?entryAvg*qty:null;
+      const exitTotal=exitAvg!==null?exitAvg*qty:null;
+      const pnl=calcPnl(trade);
+      const hold=calcDur(trade);
+      const returnPct=entryTotal?((pnl/entryTotal)*100):null;
+      const notes=(trade.postTrade||trade.preTrade||"").trim();
+      const status=getTradeOutcome(trade);
+
+      return[
+        getTradeEntryDateKey(trade)||trade.date||"",
+        trade.entries[0]?.time||"",
+        getTradeExitDateKey(trade)||trade.date||"",
+        trade.symbol||"",
+        exportMarket(trade.market),
+        status,
+        getDirectionLabel(trade.direction),
+        qty,
+        money(entryAvg),
+        money(exitAvg),
+        plainNumber(trade.targetPrice),
+        money(entryTotal),
+        money(exitTotal),
+        trade.direction==="SHORT"?"-":"+",
+        hold!==null?`${hold} MIN`:"",
+        money(pnl),
+        percent(returnPct),
+        trade.strategy||"",
+        notes,
+      ].map(csvEscape).join(",");
+    });
   const content=`\uFEFF${[columns.join(","),...rows].join("\n")}`;
   const blob=new Blob([content],{type:"text/csv;charset=utf-8;"});
   const url=URL.createObjectURL(blob);
