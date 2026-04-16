@@ -122,6 +122,7 @@ const MISTAKE_TAGS=[
   "Oversized Position",
 ];
 const POSITIVE_TAGS=[
+  "Patient",
   "Waited for Retest",
   "A+ Setup",
   "No Chase Entry",
@@ -894,6 +895,16 @@ function parseDateOnly(value){
   return new Date(Number(match[1]),Number(match[2])-1,Number(match[3]));
 }
 
+function normalizeDateKey(value){
+  const text=String(value||"").trim();
+  return parseDateOnly(text)?text:"";
+}
+
+function formatShortDate(value){
+  const date=parseDateOnly(value);
+  return date?date.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}):String(value||"");
+}
+
 function startOfDay(date){
   return new Date(date.getFullYear(),date.getMonth(),date.getDate());
 }
@@ -918,7 +929,7 @@ function startOfYear(date){
 }
 
 function getTradeDateTime(trade){
-  const date=parseDateOnly(trade?.date);
+  const date=parseDateOnly(getRowDate(trade?.entries?.[0],trade?.date));
   if(!date)return 0;
   const time=parseTimeParts(trade?.entries?.[0]?.time)||parseTimeParts(trade?.exits?.[0]?.time);
   if(time)date.setHours(time.hours,time.minutes,0,0);
@@ -926,9 +937,20 @@ function getTradeDateTime(trade){
   return date.getTime();
 }
 
+function getTradeExitDateTime(trade){
+  const date=parseDateOnly(getTradeExitDateKey(trade));
+  if(!date)return getTradeDateTime(trade);
+  const exits=getTimedTradeExitRows(trade);
+  const finalExit=exits[exits.length-1];
+  const time=parseTimeParts(finalExit?.time);
+  if(time)date.setHours(time.hours,time.minutes,0,0);
+  else date.setHours(0,0,0,0);
+  return date.getTime();
+}
+
 function matchesDatePreset(trade,preset,now=new Date()){
   if(preset==="ALL")return true;
-  const tradeDate=parseDateOnly(trade?.date);
+  const tradeDate=parseDateOnly(getRowDate(trade?.entries?.[0],trade?.date));
   if(!tradeDate)return false;
   const tradeDay=startOfDay(tradeDate);
   const today=startOfDay(now);
@@ -1126,25 +1148,74 @@ function elapsedMinutes(startMinutes,endMinutes){
   return elapsed>=0?elapsed:elapsed+(24*60);
 }
 
-function getTimedTradeRows(rows){
+function getTimedTradeRows(rows,fallbackDate=""){
   return(Array.isArray(rows)?rows:[])
-    .map((row,index)=>({index,time:row?.time||"",minutes:timeToMinutes(row?.time)}))
+    .map((row,index)=>({
+      index,
+      date:getRowDate(row,fallbackDate),
+      time:row?.time||"",
+      minutes:timeToMinutes(row?.time),
+      sortMinutes:getRowSortMinutes(row,fallbackDate),
+    }))
     .filter(row=>row.minutes!==null)
-    .sort((a,b)=>a.minutes-b.minutes||a.index-b.index);
+    .sort((a,b)=>(a.sortMinutes??a.minutes)-(b.sortMinutes??b.minutes)||a.index-b.index);
 }
 
 function calcDur(t){
   if(parseMaybeNumber(t.holdMinutes)!==null)return parseMaybeNumber(t.holdMinutes);
-  const entries=getTimedTradeRows(t.entries);
-  const exits=getTimedTradeRows(t.exits);
+  const entries=getTimedTradeRows(t.entries,t.date);
+  const exits=getTimedTradeExitRows(t);
   if(!entries.length||!exits.length)return null;
-  return elapsedMinutes(entries[0].minutes,exits[exits.length-1].minutes);
+  return elapsedTradeRowMinutes(entries[0],exits[exits.length-1]);
 }
 
 function getTradeTimeRangeLabel(trade){
-  const entries=getTimedTradeRows(trade?.entries);
-  const exits=getTimedTradeRows(trade?.exits);
-  return formatTimeRange(entries[0]?.time,exits[exits.length-1]?.time);
+  const entries=getTimedTradeRows(trade?.entries,trade?.date);
+  const exits=getTimedTradeExitRows(trade);
+  const entry=entries[0];
+  const exit=exits[exits.length-1];
+  const base=formatTimeRange(entry?.time,exit?.time);
+  if(!base||!exit?.date||exit.date===(normalizeDateKey(trade?.date)||entry?.date))return base;
+  return`${base} (${formatShortDate(exit.date)} exit)`;
+}
+
+function getTradeEntryDateKey(trade){
+  return getRowDate(trade?.entries?.[0],trade?.date);
+}
+
+function getTradeExitDateKey(trade){
+  const entryDate=getTradeEntryDateKey(trade);
+  const firstEntry=getTimedTradeRows(trade?.entries,trade?.date)[0]||null;
+  const exits=Array.isArray(trade?.exits)?trade.exits:[];
+  if(!exits.length)return entryDate;
+  const datedExits=exits
+    .map((exit,index)=>{
+      const date=getEffectiveExitDateKey(exit,entryDate,firstEntry?.minutes);
+      const parsed=parseDateOnly(date);
+      const sortMinutes=getRowSortMinutes({...exit,date},entryDate);
+      return{
+        date,
+        index,
+        sortValue:sortMinutes??(parsed?parsed.getTime()/60000:-Infinity),
+      };
+    })
+    .filter(exit=>exit.date);
+  if(!datedExits.length)return entryDate;
+  datedExits.sort((a,b)=>a.sortValue-b.sortValue||a.index-b.index);
+  return datedExits[datedExits.length-1].date;
+}
+
+function getTradeLifecycleLabel(trade){
+  const entries=getTimedTradeRows(trade?.entries,trade?.date);
+  const exits=getTimedTradeExitRows(trade);
+  const entry=entries[0]||{date:getTradeEntryDateKey(trade),time:trade?.entries?.[0]?.time||""};
+  const exit=exits[exits.length-1]||{date:getTradeExitDateKey(trade),time:trade?.exits?.[0]?.time||""};
+  const entryLabel=[entry.date?formatShortDate(entry.date):"",entry.time?formatTime12h(entry.time):""].filter(Boolean).join(" ");
+  const exitLabel=[exit.date?formatShortDate(exit.date):"",exit.time?formatTime12h(exit.time):""].filter(Boolean).join(" ");
+  if(entryLabel&&exitLabel)return`Entered ${entryLabel} | Exited ${exitLabel}`;
+  if(entryLabel)return`Entered ${entryLabel}`;
+  if(exitLabel)return`Exited ${exitLabel}`;
+  return"Entry/exit date not set";
 }
 
 function fmtDuration(minutes){
@@ -1214,6 +1285,53 @@ function timeToMinutes(value){
   return parts?(parts.hours*60)+parts.minutes:null;
 }
 
+function getRowDate(row,fallbackDate=""){
+  return normalizeDateKey(row?.date)||normalizeDateKey(fallbackDate);
+}
+
+function getRowSortMinutes(row,fallbackDate=""){
+  const minutes=timeToMinutes(row?.time);
+  if(minutes===null)return null;
+  const date=parseDateOnly(getRowDate(row,fallbackDate));
+  return date?(date.getTime()/60000)+minutes:minutes;
+}
+
+function getEffectiveExitDateKey(exit,entryDate,firstEntryMinutes=null){
+  const date=getRowDate(exit,entryDate);
+  const exitMinutes=timeToMinutes(exit?.time);
+  if(
+    date&&
+    entryDate&&
+    date===entryDate&&
+    exitMinutes!==null&&
+    firstEntryMinutes!==null&&
+    exitMinutes<firstEntryMinutes
+  ){
+    const parsed=parseDateOnly(date);
+    return parsed?dateToKey(addDays(parsed,1)):date;
+  }
+  return date;
+}
+
+function getTimedTradeExitRows(trade){
+  const entryDate=getTradeEntryDateKey(trade);
+  const firstEntry=getTimedTradeRows(trade?.entries,trade?.date)[0]||null;
+  const exits=(Array.isArray(trade?.exits)?trade.exits:[]).map(exit=>({
+    ...exit,
+    date:getEffectiveExitDateKey(exit,entryDate,firstEntry?.minutes),
+  }));
+  return getTimedTradeRows(exits,entryDate);
+}
+
+function elapsedTradeRowMinutes(start,end){
+  if(!start||!end)return null;
+  if(start.sortMinutes!==null&&end.sortMinutes!==null){
+    const elapsed=end.sortMinutes-start.sortMinutes;
+    return elapsed>=0?elapsed:elapsed+(24*60);
+  }
+  return elapsedMinutes(start.minutes,end.minutes);
+}
+
 function buildExitRoiBreakdown(trade){
   const entries=(Array.isArray(trade?.entries)?trade.entries:[])
     .map((entry,index)=>({
@@ -1221,10 +1339,11 @@ function buildExitRoiBreakdown(trade){
       price:parseMaybeNumber(entry?.price),
       qty:parseMaybeNumber(entry?.qty)??0,
       minutes:timeToMinutes(entry?.time),
+      sortMinutes:getRowSortMinutes(entry,trade?.date),
     }))
     .filter(entry=>entry.price!==null&&entry.qty>0)
     .sort((a,b)=>
-      (a.minutes??-Infinity)-(b.minutes??-Infinity)||
+      (a.sortMinutes??-Infinity)-(b.sortMinutes??-Infinity)||
       a.index-b.index
     );
 
@@ -1234,9 +1353,13 @@ function buildExitRoiBreakdown(trade){
       price:parseMaybeNumber(exit?.price),
       qty:parseMaybeNumber(exit?.qty)??0,
       minutes:timeToMinutes(exit?.time),
+      sortMinutes:getRowSortMinutes({
+        ...exit,
+        date:getEffectiveExitDateKey(exit,getTradeEntryDateKey(trade),entries[0]?.minutes),
+      },trade?.date),
     }))
     .sort((a,b)=>
-      (a.minutes??Infinity)-(b.minutes??Infinity)||
+      (a.sortMinutes??Infinity)-(b.sortMinutes??Infinity)||
       a.index-b.index
     );
 
@@ -1251,8 +1374,8 @@ function buildExitRoiBreakdown(trade){
   let activeCost=0;
 
   exits.forEach(exit=>{
-    const exitSortMinutes=exit.minutes??Infinity;
-    while(entryCursor<entries.length&&(entries[entryCursor].minutes??-Infinity)<=exitSortMinutes){
+    const exitSortMinutes=exit.sortMinutes??Infinity;
+    while(entryCursor<entries.length&&(entries[entryCursor].sortMinutes??-Infinity)<=exitSortMinutes){
       activeQty+=entries[entryCursor].qty;
       activeCost+=entries[entryCursor].price*entries[entryCursor].qty;
       entryCursor+=1;
@@ -1287,18 +1410,23 @@ function buildExitHoldBreakdown(trade){
       index,
       qty:parseMaybeNumber(entry?.qty)??0,
       minutes:timeToMinutes(entry?.time),
+      sortMinutes:getRowSortMinutes(entry,trade?.date),
     }))
-    .filter(entry=>entry.qty>0&&entry.minutes!==null)
-    .sort((a,b)=>a.minutes-b.minutes||a.index-b.index);
+    .filter(entry=>entry.qty>0&&entry.sortMinutes!==null)
+    .sort((a,b)=>a.sortMinutes-b.sortMinutes||a.index-b.index);
 
   const exits=(Array.isArray(trade?.exits)?trade.exits:[])
     .map((exit,index)=>({
       index,
       qty:parseMaybeNumber(exit?.qty)??0,
       minutes:timeToMinutes(exit?.time),
+      sortMinutes:getRowSortMinutes({
+        ...exit,
+        date:getEffectiveExitDateKey(exit,getTradeEntryDateKey(trade),entries[0]?.minutes),
+      },trade?.date),
     }))
     .sort((a,b)=>
-      (a.minutes??Infinity)-(b.minutes??Infinity)||
+      (a.sortMinutes??Infinity)-(b.sortMinutes??Infinity)||
       a.index-b.index
     );
 
@@ -1307,9 +1435,9 @@ function buildExitHoldBreakdown(trade){
   let entryCursor=0;
 
   exits.forEach(exit=>{
-    if(exit.qty<=0||exit.minutes===null)return;
+    if(exit.qty<=0||exit.sortMinutes===null)return;
 
-    while(entryCursor<entries.length&&entries[entryCursor].minutes<=exit.minutes){
+    while(entryCursor<entries.length&&entries[entryCursor].sortMinutes<=exit.sortMinutes){
       activeLots.push({...entries[entryCursor],remainingQty:entries[entryCursor].qty});
       entryCursor+=1;
     }
@@ -1321,7 +1449,7 @@ function buildExitHoldBreakdown(trade){
     while(remainingExitQty>0&&activeLots.length){
       const lot=activeLots[0];
       const consumedQty=Math.min(remainingExitQty,lot.remainingQty);
-      const hold=elapsedMinutes(lot.minutes,exit.minutes);
+      const hold=elapsedTradeRowMinutes(lot,exit);
       if(hold!==null){
         weightedHold+=hold*consumedQty;
         matchedQty+=consumedQty;
@@ -1634,16 +1762,21 @@ function normalizeTrade(trade){
   const entries=Array.isArray(trade.entries)?trade.entries:[];
   const exits=Array.isArray(trade.exits)?trade.exits:[];
   const holdMinutes=parseMaybeNumber(trade.holdMinutes);
+  const fallbackEntryDate=normalizeDateKey(trade.date)||new Date().toISOString().slice(0,10);
   const normalizedEntries=entries.map(entry=>({
     ...entry,
     price:parseMaybeNumber(entry?.price),
     qty:parseMaybeNumber(entry?.qty)??0,
+    date:getRowDate(entry,fallbackEntryDate)||fallbackEntryDate,
     time:entry?.time||"",
   }));
+  const tradeDate=getRowDate(normalizedEntries[0],trade.date);
+  const firstEntry=getTimedTradeRows(normalizedEntries,tradeDate)[0]||null;
   const normalizedExits=exits.map(exit=>({
     ...exit,
     price:parseMaybeNumber(exit?.price),
     qty:parseMaybeNumber(exit?.qty)??0,
+    date:getEffectiveExitDateKey(exit,tradeDate,firstEntry?.minutes)||tradeDate,
     time:exit?.time||"",
   }));
   if(normalizedExits[0]&& !normalizedExits[0].time && normalizedEntries[0]?.time && holdMinutes!==null){
@@ -1654,10 +1787,11 @@ function normalizeTrade(trade){
     parseMaybeNumber(trade.realizedPnl)!==null||
     (parseMaybeNumber(normalizedEntries[0]?.price)!==null&&parseMaybeNumber(normalizedExits[0]?.price)!==null);
 
-  if(!trade.symbol||!trade.date||!hasPricing)return null;
+  if(!trade.symbol||!tradeDate||!hasPricing)return null;
 
   return{
     ...trade,
+    date:tradeDate,
     market:normalizeMarket(trade.market),
     direction:normalizeDirection(trade.direction),
     targetPrice:parseMaybeNumber(trade.targetPrice)??"",
@@ -1683,11 +1817,13 @@ function normalizeTrades(trades){
 
 function tradeFingerprint(trade){
   return[
-    trade.date||"",
+    getRowDate(trade.entries?.[0],trade.date)||"",
     trade.symbol||"",
     trade.direction||"",
     trade.market||"",
+    trade.entries?.[0]?.date||"",
     trade.entries?.[0]?.time||"",
+    trade.exits?.[0]?.date||"",
     parseMaybeNumber(trade.entries?.[0]?.price)??"",
     parseMaybeNumber(trade.exits?.[0]?.price)??"",
     parseMaybeNumber(trade.entries?.[0]?.qty)??"",
@@ -4081,16 +4217,17 @@ function buildWeekdayAnalysis(trades){
 function buildCalendarSummary(trades){
   const byDate={};
   trades.forEach(trade=>{
-    if(!trade.date)return;
+    const calendarDate=getTradeExitDateKey(trade);
+    if(!calendarDate)return;
     const pnl=calcPnl(trade);
     const outcome=getTradeOutcome(trade);
     const basis=calcEntryNotional(trade);
-    if(!byDate[trade.date])byDate[trade.date]={pnl:0,basis:0,trades:0,wins:0,losses:0};
-    byDate[trade.date].pnl+=pnl;
-    byDate[trade.date].basis+=basis;
-    byDate[trade.date].trades++;
-    if(outcome==="WIN")byDate[trade.date].wins++;
-    if(outcome==="LOSS")byDate[trade.date].losses++;
+    if(!byDate[calendarDate])byDate[calendarDate]={pnl:0,basis:0,trades:0,wins:0,losses:0};
+    byDate[calendarDate].pnl+=pnl;
+    byDate[calendarDate].basis+=basis;
+    byDate[calendarDate].trades++;
+    if(outcome==="WIN")byDate[calendarDate].wins++;
+    if(outcome==="LOSS")byDate[calendarDate].losses++;
   });
   return byDate;
 }
@@ -4125,7 +4262,7 @@ function buildBestWorstTradingDays(trades,limitPerSide=4){
 }
 
 function AnalyticsCalendar({trades}){
-  const tradeDates=trades.map(trade=>parseDateOnly(trade.date)).filter(Boolean).sort((a,b)=>a-b);
+  const tradeDates=trades.map(trade=>parseDateOnly(getTradeExitDateKey(trade))).filter(Boolean).sort((a,b)=>a-b);
   const latestDate=tradeDates.length?tradeDates[tradeDates.length-1]:startOfDay(new Date());
   const [selectedMonth,setSelectedMonth]=useState(latestDate.getMonth());
   const [selectedYear,setSelectedYear]=useState(latestDate.getFullYear());
@@ -4133,9 +4270,10 @@ function AnalyticsCalendar({trades}){
   const calendarRef=useRef(null);
   const dailySummary=buildCalendarSummary(trades);
   const tradesByDate=trades.reduce((groups,trade)=>{
-    if(!trade.date)return groups;
-    if(!groups[trade.date])groups[trade.date]=[];
-    groups[trade.date].push(trade);
+    const calendarDate=getTradeExitDateKey(trade);
+    if(!calendarDate)return groups;
+    if(!groups[calendarDate])groups[calendarDate]=[];
+    groups[calendarDate].push(trade);
     return groups;
   },{});
   const displayMoney=value=>`${value<0?"-":""}$${Math.abs(value).toFixed(2)}`;
@@ -4156,7 +4294,7 @@ function AnalyticsCalendar({trades}){
   const monthOptions=Array.from({length:12},(_,index)=>new Date(2026,index,1).toLocaleString("en-US",{month:"long"}));
   const weeks=[];
   const selectedDayTrades=selectedDayKey
-    ?[...(tradesByDate[selectedDayKey]||[])].sort((a,b)=>getTradeDateTime(b)-getTradeDateTime(a))
+    ?[...(tradesByDate[selectedDayKey]||[])].sort((a,b)=>getTradeExitDateTime(b)-getTradeExitDateTime(a))
     :[];
   const selectedDayDate=selectedDayKey?parseDateOnly(selectedDayKey):null;
   const selectedDaySummary=selectedDayKey?dailySummary[selectedDayKey]||null:null;
@@ -4382,7 +4520,7 @@ function AnalyticsCalendar({trades}){
             const hold=calcDur(trade);
             const entryAvg=averagePrice(trade.entries);
             const exitAvg=averagePrice(trade.exits);
-            const timeRange=getTradeTimeRangeLabel(trade);
+            const lifecycleLabel=getTradeLifecycleLabel(trade);
             const notes=clipText((trade.postTrade||trade.preTrade||"").trim(),180);
             return<div key={trade.id} style={{padding:"18px 18px 16px",borderRadius:20,background:C.surfaceAlt,boxShadow:C.shadow,display:"grid",gap:14}}>
               <div style={{display:"flex",justifyContent:"space-between",gap:16,alignItems:"flex-start",flexWrap:"wrap"}}>
@@ -4394,7 +4532,7 @@ function AnalyticsCalendar({trades}){
                     <Pill label={trade.market} color={C.teal}/>
                   </div>
                   <div style={{fontSize:13,color:C.muted,lineHeight:1.7}}>
-                    {timeRange||"Time not set"} / {qty} contract{qty!==1?"s":""} / {hold===null?"Hold N/A":`${fmtDuration(hold)} hold`}
+                    {lifecycleLabel} / {qty} contract{qty!==1?"s":""} / {hold===null?"Hold N/A":`${fmtDuration(hold)} hold`}
                   </div>
                 </div>
                 <div style={{textAlign:"right"}}>
@@ -4609,7 +4747,7 @@ function TradeLogView({trades,onSelect,onNew,onEdit,onImportCSV,onExportCSV,onRe
 // â”€â”€ TRADE DETAIL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function TradeDetail({trade,onBack,onEdit,onDelete}){
   const pnl=calcPnl(trade),rr=calcRR(trade),dur=calcDur(trade);
-  const timeRange=getTradeTimeRangeLabel(trade);
+  const lifecycleLabel=getTradeLifecycleLabel(trade);
   const exitRoiBreakdown=buildExitRoiBreakdown(trade);
   const exitHoldBreakdown=buildExitHoldBreakdown(trade);
   const [delConfirm,setDelConfirm]=useState(false);
@@ -4640,7 +4778,7 @@ function TradeDetail({trade,onBack,onEdit,onDelete}){
             <Pill label={trade.emotion} color="transparent"/>
           </div>
           <div style={{fontSize:40,fontWeight:800,color:C.text,fontFamily:"'Sora','Manrope',sans-serif",lineHeight:1,marginBottom:8}}>{trade.symbol}</div>
-          <div style={{fontSize:14,color:C.muted,lineHeight:1.8}}>{trade.date}{timeRange?` | ${timeRange}`:""}</div>
+          <div style={{fontSize:14,color:C.muted,lineHeight:1.8}}>{lifecycleLabel}</div>
         </div>
         <div style={{textAlign:"right"}}>
           <div style={{fontSize:42,fontWeight:800,color:pnl>=0?C.green:C.red,fontFamily:"'Sora','Manrope',sans-serif",lineHeight:1}}>{pnl>=0?"+$":"-$"}{Math.abs(pnl).toFixed(2)}</div>
@@ -4663,7 +4801,7 @@ function TradeDetail({trade,onBack,onEdit,onDelete}){
           {trade.entries.map((e,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 0",borderBottom:"1px solid rgba(148,163,184,0.18)"}}>
             <div>
               <div style={{fontSize:14,fontWeight:700,color:C.text}}>Entry {i+1}</div>
-              <div style={{fontSize:12,color:C.muted}}>{e.time?formatTime12h(e.time):"Time not set"}</div>
+              <div style={{fontSize:12,color:C.muted}}>{[getRowDate(e,trade.date)?formatShortDate(getRowDate(e,trade.date)):"",e.time?formatTime12h(e.time):""].filter(Boolean).join(" | ")||"Date/time not set"}</div>
             </div>
             <div style={{fontSize:15,fontWeight:700,color:C.text,fontFamily:"'Sora','Manrope',sans-serif"}}>${(+e.price).toFixed(2)} x {e.qty}</div>
           </div>)}
@@ -4683,11 +4821,13 @@ function TradeDetail({trade,onBack,onEdit,onDelete}){
             const avgCost=breakdown?.avgCost;
             const price=parseMaybeNumber(e.price);
             const qty=parseMaybeNumber(e.qty)??0;
+            const exitDate=getRowDate(e,trade.date);
+            const exitSchedule=[exitDate?formatShortDate(exitDate):"",e.time?formatTime12h(e.time):""].filter(Boolean).join(" | ")||"Date/time not set";
             const roiColor=roi===null?C.dim:roi>=0?C.green:C.red;
             return <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:16,padding:"14px 0",borderBottom:"1px solid rgba(148,163,184,0.18)"}}>
               <div>
                 <div style={{fontSize:14,fontWeight:700,color:C.text}}>Exit {i+1}</div>
-                <div style={{fontSize:12,color:C.muted}}>{e.time?formatTime12h(e.time):"Time not set"}</div>
+                <div style={{fontSize:12,color:C.muted}}>{exitSchedule}</div>
                 <div style={{fontSize:12,color:C.muted,marginTop:4}}>
                   {Number.isFinite(hold)?`${fmtDuration(hold)} hold`:"Hold N/A"}
                 </div>
@@ -4739,15 +4879,41 @@ function TradeDetail({trade,onBack,onEdit,onDelete}){
 
 // â”€â”€ TRADE FORM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function TradeForm({initial,onSave,onCancel}){
-  const blank={date:new Date().toISOString().slice(0,10),symbol:"SPY",market:"Stocks",direction:"LONG",entries:[{price:"",qty:"",time:""}],exits:[{price:"",qty:"",time:""}],targetPrice:"",stopLoss:"",fees:"",strategy:"ORB",mistakes:[],positiveTags:[],emotion:"Calm",preTrade:"",postTrade:"",screenshots:[]};
-  const[f,setF]=useState(initial?{...blank,...initial,screenshots:Array.isArray(initial.screenshots)?initial.screenshots:[]} : blank);
+  const today=new Date().toISOString().slice(0,10);
+  const blank={date:today,symbol:"SPY",market:"Stocks",direction:"LONG",entries:[{price:"",qty:"",date:today,time:""}],exits:[{price:"",qty:"",date:today,time:""}],targetPrice:"",stopLoss:"",fees:"",strategy:"ORB",mistakes:[],positiveTags:[],emotion:"Calm",preTrade:"",postTrade:"",screenshots:[]};
+  const baseEntryDate=initial?getRowDate(initial.entries?.[0],initial.date)||today:today;
+  const baseEntryMinutes=initial?timeToMinutes(initial.entries?.[0]?.time):null;
+  const initialForm=initial?{
+    ...blank,
+    ...initial,
+    date:baseEntryDate,
+    entries:(Array.isArray(initial.entries)?initial.entries:blank.entries).map(entry=>({...entry,date:getRowDate(entry,baseEntryDate)||baseEntryDate})),
+    exits:(Array.isArray(initial.exits)?initial.exits:blank.exits).map(exit=>({...exit,date:getEffectiveExitDateKey(exit,baseEntryDate,baseEntryMinutes)||baseEntryDate})),
+    screenshots:Array.isArray(initial.screenshots)?initial.screenshots:[],
+  }:blank;
+  const[f,setF]=useState(initialForm);
   const[errs,setErrs]=useState({});
   const[imageBusy,setImageBusy]=useState(false);
   const[imageError,setImageError]=useState("");
   const u=(k,v)=>setF(p=>({...p,[k]:v}));
   const ue=(arr,k,i,v)=>{const a=[...f[arr]];a[i]={...a[i],[k]:v};u(arr,a);};
-  const addRow=arr=>u(arr,[...f[arr],{price:"",qty:"",time:""}]);
-  const rmRow=(arr,i)=>u(arr,f[arr].filter((_,j)=>j!==i));
+  const updateEntryDate=(index,value)=>setF(current=>{
+    const entries=[...current.entries];
+    const previousDate=entries[index]?.date||current.date;
+    entries[index]={...entries[index],date:value};
+    const isPrimary=index===0;
+    return{
+      ...current,
+      date:isPrimary?value:current.date,
+      entries,
+      exits:isPrimary?current.exits.map(exit=>({...exit,date:!exit.date||exit.date===previousDate?value:exit.date})):current.exits,
+    };
+  });
+  const addRow=arr=>u(arr,[...f[arr],{price:"",qty:"",time:"",date:f.date}]);
+  const rmRow=(arr,i)=>setF(current=>({
+    ...current,
+    [arr]:current[arr].filter((_,j)=>j!==i),
+  }));
   const toggleM=m=>u("mistakes",f.mistakes.includes(m)?f.mistakes.filter(x=>x!==m):[...f.mistakes,m]);
   const togglePositiveTag=tag=>u("positiveTags",f.positiveTags.includes(tag)?f.positiveTags.filter(x=>x!==tag):[...f.positiveTags,tag]);
   const removeScreenshot=index=>u("screenshots",f.screenshots.filter((_,currentIndex)=>currentIndex!==index));
@@ -4801,13 +4967,23 @@ function TradeForm({initial,onSave,onCancel}){
   const validate=()=>{
     const e={};
     if(!f.symbol)e.symbol="Required";
-    if(!f.date)e.date="Required";
+    if(!getRowDate(f.entries[0],f.date))e.date="Required";
     if(!f.entries[0]?.price)e.ep="Entry price required";
     if(!f.exits[0]?.price)e.xp="Exit price required";
     if(!f.entries[0]?.qty)e.eq="Quantity required";
     setErrs(e);return Object.keys(e).length===0;
   };
-  const save=()=>{if(!validate())return;onSave({...f,id:f.id||"t"+Date.now()});};
+  const save=()=>{
+    if(!validate())return;
+    const entryDate=getRowDate(f.entries[0],f.date);
+    onSave({
+      ...f,
+      date:entryDate,
+      entries:f.entries.map(entry=>({...entry,date:getRowDate(entry,entryDate)})),
+      exits:f.exits.map(exit=>({...exit,date:getRowDate(exit,entryDate)})),
+      id:f.id||"t"+Date.now(),
+    });
+  };
   return<div style={{display:"flex",flexDirection:"column",gap:20,animation:"riseIn .45s ease both"}}>
     <PageIntro
       eyebrow="Trade Entry"
@@ -4818,7 +4994,6 @@ function TradeForm({initial,onSave,onCancel}){
 
     <Card style={{padding:"24px 24px 18px"}}>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:16}}>
-        <FormField label="Date" err={errs.date}><input type="date" value={f.date} onChange={e=>u("date",e.target.value)} style={inp()}/></FormField>
         <FormField label="Symbol" err={errs.symbol}><input value={f.symbol} onChange={e=>u("symbol",e.target.value.toUpperCase())} placeholder="SPY" style={inp()}/></FormField>
         <FormField label="Market"><select value={f.market} onChange={e=>u("market",e.target.value)} style={inp()}>{MARKETS.map(m=><option key={m}>{m}</option>)}</select></FormField>
         <FormField label="Direction">
@@ -4832,9 +5007,10 @@ function TradeForm({initial,onSave,onCancel}){
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",gap:18}}>
       <Card style={{padding:"22px 22px 18px"}}>
         <SLabel>Entries</SLabel>
-        {f.entries.map((e,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"minmax(120px,1fr) 90px minmax(170px,1fr) auto",gap:10,marginBottom:10,alignItems:"center"}}>
+        {f.entries.map((e,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"minmax(110px,1fr) 80px minmax(145px,1fr) minmax(170px,1fr) auto",gap:10,marginBottom:10,alignItems:"center"}}>
           <input type="number" value={e.price} onChange={v=>ue("entries","price",i,v.target.value)} placeholder="Price" style={inp({boxShadow:errs.ep&&i===0?`inset 0 0 0 1px ${C.red}`:undefined})}/>
           <input type="number" value={e.qty} onChange={v=>ue("entries","qty",i,v.target.value)} placeholder="Qty" style={inp({boxShadow:errs.eq&&i===0?`inset 0 0 0 1px ${C.red}`:undefined})}/>
+          <input type="date" aria-label={`Entry ${i+1} date`} value={e.date||f.date} onChange={v=>updateEntryDate(i,v.target.value)} style={inp({boxShadow:errs.date&&i===0?`inset 0 0 0 1px ${C.red}`:undefined})}/>
           <TimeInput12h value={e.time} onChange={v=>ue("entries","time",i,v)}/>
           {i>0&&<button onClick={()=>rmRow("entries",i)} style={{...btnBase(),padding:"10px 12px",background:C.redBg,color:C.red}}>Remove</button>}
         </div>)}
@@ -4847,9 +5023,10 @@ function TradeForm({initial,onSave,onCancel}){
 
       <Card style={{padding:"22px 22px 18px"}}>
         <SLabel>Exits</SLabel>
-        {f.exits.map((e,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"minmax(120px,1fr) 90px minmax(170px,1fr) auto",gap:10,marginBottom:10,alignItems:"center"}}>
+        {f.exits.map((e,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"minmax(110px,1fr) 80px minmax(145px,1fr) minmax(170px,1fr) auto",gap:10,marginBottom:10,alignItems:"center"}}>
           <input type="number" value={e.price} onChange={v=>ue("exits","price",i,v.target.value)} placeholder="Price" style={inp({boxShadow:errs.xp&&i===0?`inset 0 0 0 1px ${C.red}`:undefined})}/>
           <input type="number" value={e.qty} onChange={v=>ue("exits","qty",i,v.target.value)} placeholder="Qty" style={inp()}/>
+          <input type="date" aria-label={`Exit ${i+1} date`} value={e.date||f.date} onChange={v=>ue("exits","date",i,v.target.value)} style={inp()}/>
           <TimeInput12h value={e.time} onChange={v=>ue("exits","time",i,v)}/>
           {i>0&&<button onClick={()=>rmRow("exits",i)} style={{...btnBase(),padding:"10px 12px",background:C.redBg,color:C.red}}>Remove</button>}
         </div>)}
@@ -5837,18 +6014,20 @@ function importCSV(text){
 
       return normalizeTrade({
         id:`csv-${Date.now()}-${index}-${Math.random().toString(36).slice(2,8)}`,
-        date:row.date||new Date().toISOString().slice(0,10),
+        date:row.entry_date||row.date||new Date().toISOString().slice(0,10),
         symbol:(row.symbol||row.ticker||"SPY").toUpperCase(),
         market:normalizeMarket(row.market),
         direction:normalizeDirection(row.side||row.direction),
         entries:[{
           price:parseMaybeNumber(row.entry??row.entry_price),
           qty,
+          date:row.entry_date||row.date||"",
           time:row.time||row.entry_time||"09:30",
         }],
         exits:[{
           price:parseMaybeNumber(row.exit??row.exit_price),
           qty,
+          date:row.exit_date||row.date_exit||row.closed_date||row.close_date||row.entry_date||row.date||"",
           time:row.exit_time||"",
         }],
         targetPrice:parseMaybeNumber(row.target??row.target_price)??"",
@@ -5901,7 +6080,7 @@ function exportCSV(trades){
     if(!totalQty)return null;
     return rows.reduce((sum,row)=>sum+((+row.price||0)*(+row.qty||0)),0)/totalQty;
   };
-  const columns=["Date","Time","Symbol","Market","Status","Side","Qty","Entry","Exit","Target","Ent Tot","Ext Tot","Pos","Hold","Return","Return %","Tags","Notes"];
+  const columns=["Entry Date","Entry Time","Exit Date","Symbol","Market","Status","Side","Qty","Entry","Exit","Target","Ent Tot","Ext Tot","Pos","Hold","Return","Return %","Tags","Notes"];
   const rows=trades.map(trade=>{
     const qty=trade.entries.reduce((sum,row)=>sum+(+row.qty||0),0)||trade.exits.reduce((sum,row)=>sum+(+row.qty||0),0)||1;
     const entryAvg=averagePrice(trade.entries);
@@ -5915,8 +6094,9 @@ function exportCSV(trades){
     const status=getTradeOutcome(trade);
 
     return[
-      trade.date||"",
+      trade.entries[0]?.date||trade.date||"",
       trade.entries[0]?.time||"",
+      trade.exits[0]?.date||trade.date||"",
       trade.symbol||"",
       exportMarket(trade.market),
       status,
