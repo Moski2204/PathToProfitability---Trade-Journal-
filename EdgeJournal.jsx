@@ -4376,6 +4376,15 @@ function AnalyticsCalendar({trades}){
       losses,
     });
   }
+  const monthSummary=weeks.reduce((summary,week)=>({
+    pnl:summary.pnl+week.pnl,
+    basis:summary.basis+week.days.filter(day=>day.inMonth).reduce((sum,day)=>sum+day.summary.basis,0),
+    trades:summary.trades+week.tradesTaken,
+    wins:summary.wins+week.wins,
+    losses:summary.losses+week.losses,
+  }),{pnl:0,basis:0,trades:0,wins:0,losses:0});
+  const monthReturn=monthSummary.basis?monthSummary.pnl/monthSummary.basis:null;
+  const monthPnlColor=monthSummary.pnl>0?C.green:monthSummary.pnl<0?C.red:C.text;
 
   return<div ref={calendarRef} style={{display:"grid",gap:16}}>
     <div style={{display:"flex",justifyContent:"space-between",gap:12,alignItems:"center",flexWrap:"wrap"}}>
@@ -4390,6 +4399,13 @@ function AnalyticsCalendar({trades}){
         <select value={selectedYear} onChange={e=>setSelectedYear(Number(e.target.value))} style={{...inp(),width:"auto",minWidth:120,height:44,padding:"0 14px"}}>
           {years.map(year=><option key={year} value={year}>{year}</option>)}
         </select>
+        <div style={{minWidth:190,padding:"9px 14px",borderRadius:16,background:C.surfaceAlt,boxShadow:C.shadow,display:"grid",gap:3}}>
+          <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",fontWeight:800}}>Monthly P&amp;L</div>
+          <div style={{fontSize:24,fontWeight:900,color:monthPnlColor,fontFamily:"'Sora','Manrope',sans-serif",lineHeight:1}}>{displayMoney(monthSummary.pnl)}</div>
+          <div style={{fontSize:12,color:C.muted}}>
+            {monthSummary.trades} trade{monthSummary.trades!==1?"s":""}{monthReturn!==null?` / ${fmtPct(monthReturn)}`:""}
+          </div>
+        </div>
       </div>
     </div>
 
