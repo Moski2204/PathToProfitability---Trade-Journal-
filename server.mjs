@@ -403,6 +403,13 @@ app.put("/api/trades", authenticate, async (req, res) => {
   return res.json({ trades: user.trades });
 });
 
+app.get("/api/account-transactions", authenticate, async (req, res) => {
+  return res.json({
+    starting_balance: req.user.starting_balance || 0,
+    account_transactions: getUserAccountTransactions(req.user),
+  });
+});
+
 app.put("/api/account-transactions", authenticate, async (req, res) => {
   const startingBalance = req.body?.starting_balance;
   const accountTransactions = req.body?.account_transactions;

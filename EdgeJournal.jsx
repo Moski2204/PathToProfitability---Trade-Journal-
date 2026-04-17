@@ -234,8 +234,16 @@ function getStoredAccountLedgerKey(userId){
 
 function loadStoredAccountLedger(userId){
   if(!userId)return{startingBalance:0,transactions:[]};
+  const primaryLedger=readStoredAccountLedger(getStoredAccountLedgerKey(userId),userId);
+  const guestLedger=String(userId||"").trim()==="guest"
+    ?{startingBalance:0,transactions:[]}
+    :readStoredAccountLedger(getStoredAccountLedgerKey("guest"),userId);
+  return mergeAccountLedgers(primaryLedger,guestLedger,userId);
+}
+
+function readStoredAccountLedger(key,userId){
   try{
-    const raw=storage.get(getStoredAccountLedgerKey(userId)).value;
+    const raw=storage.get(key).value;
     const parsed=raw?JSON.parse(raw):{};
     return{
       startingBalance:normalizeStartingBalance(parsed.startingBalance??parsed.starting_balance),
@@ -244,6 +252,23 @@ function loadStoredAccountLedger(userId){
   }catch{
     return{startingBalance:0,transactions:[]};
   }
+}
+
+function hasAccountLedgerData(ledger){
+  return normalizeStartingBalance(ledger?.startingBalance??ledger?.starting_balance)!==0||
+    normalizeAccountTransactions(ledger?.transactions??ledger?.account_transactions).length>0;
+}
+
+function mergeAccountLedgers(primary={},fallback={},userId=""){
+  const primaryStartingBalance=normalizeStartingBalance(primary.startingBalance??primary.starting_balance);
+  const fallbackStartingBalance=normalizeStartingBalance(fallback.startingBalance??fallback.starting_balance);
+  const primaryTransactions=normalizeAccountTransactions(primary.transactions??primary.account_transactions,userId);
+  const fallbackTransactions=normalizeAccountTransactions(fallback.transactions??fallback.account_transactions,userId);
+
+  return{
+    startingBalance:primaryStartingBalance!==0?primaryStartingBalance:fallbackStartingBalance,
+    transactions:normalizeAccountTransactions([...primaryTransactions,...fallbackTransactions],userId),
+  };
 }
 
 function saveStoredAccountLedger(userId,{startingBalance,transactions}){
@@ -6247,7 +6272,40 @@ function App(){
   const openTradeDetail=trade=>{startTransition(()=>{setSelected(trade);setEditing(null);setShowForm(false);});};
   const closeDetailView=()=>{startTransition(()=>setSelected(null));};
   const closeTradeForm=()=>{startTransition(()=>{setShowForm(false);setEditing(null);});};
-  const openAccountModal=()=>startTransition(()=>setAccountModalOpen(true));
+  const commitAccountLedger=(primaryLedger,fallbackLedger={startingBalance,transactions:accountTransactions},nextUser=user)=>{
+    const mergedLedger=mergeAccountLedgers(primaryLedger,fallbackLedger,nextUser?.id);
+    setStartingBalance(mergedLedger.startingBalance);
+    setAccountTransactions(mergedLedger.transactions);
+    if(nextUser?.id&&hasAccountLedgerData(mergedLedger)){
+      try{saveStoredAccountLedger(nextUser.id,mergedLedger);}catch{}
+    }
+    return mergedLedger;
+  };
+  const refreshAccountLedger=async({silent=true}={})=>{
+    if(!authToken||authSource==="local")return false;
+
+    try{
+      let data;
+      try{
+        data=await apiRequest("/api/account-transactions",{token:authToken});
+      }catch{
+        data=await apiRequest("/api/auth/session",{token:authToken});
+      }
+      commitAccountLedger(
+        {startingBalance:data.starting_balance,transactions:data.account_transactions},
+        {startingBalance,transactions:accountTransactions},
+        user,
+      );
+      return true;
+    }catch(error){
+      if(!silent)notify(error.message||"Unable to refresh account transactions.",C.red);
+      return false;
+    }
+  };
+  const openAccountModal=()=>{
+    startTransition(()=>setAccountModalOpen(true));
+    void refreshAccountLedger();
+  };
   const closeAccountModal=()=>startTransition(()=>setAccountModalOpen(false));
   const syncTrades=async(nextTrades,successMessage,successColor=C.green)=>{
     if(!authToken){
@@ -6290,12 +6348,11 @@ function App(){
             account_transactions:payload.transactions,
           },
         });
-      setStartingBalance(normalizeStartingBalance(data.starting_balance));
-      setAccountTransactions(normalizeAccountTransactions(data.account_transactions,user?.id));
-      if(user?.id)saveStoredAccountLedger(user.id,{
-        startingBalance:data.starting_balance,
-        transactions:data.account_transactions,
-      });
+      commitAccountLedger(
+        {startingBalance:data.starting_balance,transactions:data.account_transactions},
+        payload,
+        user,
+      );
       if(successMessage)notify(successMessage,successColor);
       return true;
     }catch(error){
@@ -6393,9 +6450,7 @@ function App(){
       transactions:normalizeAccountTransactions(nextAccountTransactions,nextUser?.id),
     };
     const storedLedger=loadStoredAccountLedger(nextUser?.id);
-    const hasServerLedger=serverLedger.transactions.length>0||serverLedger.startingBalance!==0;
-    setAccountTransactions(hasServerLedger?serverLedger.transactions:storedLedger.transactions);
-    setStartingBalance(hasServerLedger?serverLedger.startingBalance:storedLedger.startingBalance);
+    commitAccountLedger(serverLedger,storedLedger,nextUser);
 
     const serverTrades=normalizeTrades(nextTrades);
     const legacyTrades=loadLegacyTradesFromStorage();
