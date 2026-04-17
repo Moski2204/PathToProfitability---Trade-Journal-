@@ -973,9 +973,9 @@ function getTradeExitDateTime(trade){
   return date.getTime();
 }
 
-function matchesDatePreset(trade,preset,now=new Date()){
+function matchesDatePreset(trade,preset,now=new Date(),getDateKey=trade=>getRowDate(trade?.entries?.[0],trade?.date)){
   if(preset==="ALL")return true;
-  const tradeDate=parseDateOnly(getRowDate(trade?.entries?.[0],trade?.date));
+  const tradeDate=parseDateOnly(getDateKey(trade));
   if(!tradeDate)return false;
   const tradeDay=startOfDay(tradeDate);
   const today=startOfDay(now);
@@ -998,6 +998,14 @@ function matchesDatePreset(trade,preset,now=new Date()){
   if(preset==="LAST_MONTH")return tradeDay>=lastMonthStart&&tradeDay<thisMonthStart;
   if(preset==="THIS_YEAR")return tradeDay>=thisYearStart&&tradeDay<nextYearStart;
   return true;
+}
+
+function getTradeLogDateKey(trade){
+  return getTradeExitDateKey(trade)||getTradeEntryDateKey(trade)||normalizeDateKey(trade?.date);
+}
+
+function getTradeLogDateTime(trade){
+  return getTradeExitDateTime(trade)||getTradeDateTime(trade);
 }
 
 function normalizeMarket(value){
@@ -2737,6 +2745,9 @@ function TradeCard({trade,pnl,onSelect,onEdit}){
   const entryNotional=calcEntryNotional(trade);
   const returnPct=entryNotional?pnl/entryNotional:null;
   const timeRange=getTradeTimeRangeLabel(trade);
+  const tradeLogDate=getTradeLogDateKey(trade);
+  const entryDate=getTradeEntryDateKey(trade);
+  const dateLabel=tradeLogDate&&entryDate&&tradeLogDate!==entryDate?`Closed ${tradeLogDate}`:tradeLogDate||trade.date;
   const contractLabel=formatContractQty(calcContractQty(trade));
   const pre=cleanTradeNoteText(trade.preTrade);
   const post=cleanTradeNoteText(trade.postTrade);
@@ -2782,7 +2793,7 @@ function TradeCard({trade,pnl,onSelect,onEdit}){
               <Pill label={trade.strategy} color={C.purple}/>
             </div>
             <div style={{fontSize:13,color:C.muted,lineHeight:1.7}}>
-              {trade.date}{timeRange?` | ${timeRange}`:""} | {contractLabel} | {trade.market} | {trade.emotion}
+              {dateLabel}{timeRange?` | ${timeRange}`:""} | {contractLabel} | {trade.market} | {trade.emotion}
             </div>
           </div>
         </div>
@@ -4643,7 +4654,8 @@ function TradeLogView({trades,onSelect,onNew,onEdit,onImportCSV,onExportCSV,onRe
     };
     const matchesSearch=trade=>!searchNeedle||trade.symbol.toLowerCase().includes(searchNeedle)||trade.strategy.toLowerCase().includes(searchNeedle);
     const searchedTrades=trades.filter(matchesSearch);
-    const currentDateScope=searchedTrades.filter(trade=>matchesDatePreset(trade,datePreset));
+    const matchesTradeLogDatePreset=(trade,preset)=>matchesDatePreset(trade,preset,new Date(),getTradeLogDateKey);
+    const currentDateScope=searchedTrades.filter(trade=>matchesTradeLogDatePreset(trade,datePreset));
     const currentResultScope=searchedTrades.filter(trade=>matchesResultFilter(trade,filter));
     const nextFilterPnls=Object.fromEntries(RESULT_FILTERS.map(nextFilter=>[
       nextFilter,
@@ -4654,13 +4666,13 @@ function TradeLogView({trades,onSelect,onNew,onEdit,onImportCSV,onExportCSV,onRe
     const nextDatePnls=Object.fromEntries(DATE_PRESETS.map(preset=>[
       preset.key,
       currentResultScope
-        .filter(trade=>matchesDatePreset(trade,preset.key))
+        .filter(trade=>matchesTradeLogDatePreset(trade,preset.key))
         .reduce((sum,trade)=>sum+pnlMap[trade.id],0),
     ]));
     const nextRows=[...searchedTrades
-      .filter(trade=>matchesResultFilter(trade,filter)&&matchesDatePreset(trade,datePreset))]
+      .filter(trade=>matchesResultFilter(trade,filter)&&matchesTradeLogDatePreset(trade,datePreset))]
       .sort((a,b)=>{
-        const timeDelta=getTradeDateTime(b)-getTradeDateTime(a);
+        const timeDelta=getTradeLogDateTime(b)-getTradeLogDateTime(a);
         if(sortK==="date-desc")return timeDelta;
         if(sortK==="date-asc")return -timeDelta;
         if(sortK==="pnl-desc")return pnlMap[b.id]-pnlMap[a.id]||timeDelta;
